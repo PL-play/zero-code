@@ -355,7 +355,8 @@ MICRO_SIZE_LIMIT = 1000  # offload tool outputs larger than this (chars)
 class ContextManager:
     """Microcompact + auto-compact + manual-compact with rehydration."""
 
-    def __init__(self):
+    def __init__(self, role: str = "main"):
+        self.role = role
         self.recent_files: list[str] = []
         self._file_counter = 0
         self.last_input_tokens = 0
@@ -363,6 +364,8 @@ class ContextManager:
         self.total_output_tokens = 0
         self.cache_read_tokens = 0
         self.api_calls = 0
+        self._compact_count = 0
+        self.subagent_records: list[dict] = []
 
     def track_file(self, path: str):
         if path in self.recent_files:
@@ -400,6 +403,40 @@ class ContextManager:
     def reset_usage(self):
         """Reset after compaction."""
         self.last_input_tokens = 0
+
+    def record_subagent(self, label: str, sub_ctx: "ContextManager"):
+        """Merge a subagent's usage into the global record."""
+        rec = {
+            "label": label,
+            "input_tokens": sub_ctx.total_input_tokens,
+            "output_tokens": sub_ctx.total_output_tokens,
+            "cache_read": sub_ctx.cache_read_tokens,
+            "api_calls": sub_ctx.api_calls,
+            "compactions": getattr(sub_ctx, "_compact_count", 0),
+        }
+        self.subagent_records.append(rec)
+        self.total_input_tokens += sub_ctx.total_input_tokens
+        self.total_output_tokens += sub_ctx.total_output_tokens
+        self.cache_read_tokens += sub_ctx.cache_read_tokens
+        self.api_calls += sub_ctx.api_calls
+
+    def all_usage_summary(self) -> str:
+        """Full usage including subagent breakdown."""
+        lines = [
+            f"Main:  {self.total_input_tokens - sum(r['input_tokens'] for r in self.subagent_records):,}in "
+            f"+ {self.total_output_tokens - sum(r['output_tokens'] for r in self.subagent_records):,}out "
+            f"| calls={self.api_calls - sum(r['api_calls'] for r in self.subagent_records)}",
+        ]
+        for i, r in enumerate(self.subagent_records):
+            lines.append(
+                f"Sub#{i+1} ({r['label']}): {r['input_tokens']:,}in + {r['output_tokens']:,}out "
+                f"| calls={r['api_calls']} compact={r['compactions']}"
+            )
+        lines.append(
+            f"Total: {self.total_input_tokens:,}in + {self.total_output_tokens:,}out "
+            f"| cache_read={self.cache_read_tokens:,} | calls={self.api_calls}"
+        )
+        return "\n".join(lines)
 
     # -- microcompaction ----------------------------------------------------
 
@@ -471,6 +508,7 @@ class ContextManager:
 
     def compact(self, messages: list, focus: str = None) -> list:
         """Summarize conversation and rehydrate with todo + recent files."""
+        self._compact_count += 1
         transcript_path = CACHE_DIR / f"transcript_{int(time.time())}.jsonl"
         with open(transcript_path, "w", encoding="utf-8") as f:
             for msg in messages:
@@ -1102,12 +1140,14 @@ def run_subagent(prompt: str, mode: str = "execute", max_rounds: int = 30) -> st
     is_explore = mode == "explore"
     tools = EXPLORE_TOOLS if is_explore else CHILD_TOOLS
     sys_prompt = EXPLORE_SUBAGENT_SYSTEM if is_explore else SUBAGENT_SYSTEM
+    label = prompt[:40].replace("\n", " ").strip()
 
-    sub_messages = [{"role": "user", "content": prompt}]
+    sub_ctx = ContextManager(role=f"sub:{label}")
+    sub_messages: list = [{"role": "user", "content": prompt}]
     response = None
     hit_limit = False
 
-    for _ in range(max_rounds):
+    for round_idx in range(max_rounds):
         response = client.messages.create(
             model=MODEL,
             system=sys_prompt,
@@ -1115,6 +1155,8 @@ def run_subagent(prompt: str, mode: str = "execute", max_rounds: int = 30) -> st
             tools=tools,
             max_tokens=8000,
         )
+        sub_ctx.update_usage(response)
+
         assistant_msg = {
             "role": "assistant",
             "content": [block.model_dump() for block in response.content],
@@ -1147,10 +1189,16 @@ def run_subagent(prompt: str, mode: str = "execute", max_rounds: int = 30) -> st
                 "content": str(output)[:50000],
             })
         sub_messages.append({"role": "user", "content": results})
+
+        if sub_ctx.should_compact():
+            UI.tool_call("compact", f"subagent auto-compact at round {round_idx+1}", is_sub=True)
+            sub_messages = sub_ctx.compact(sub_messages)
+            sub_ctx.reset_usage()
     else:
         hit_limit = True
 
     if response is None:
+        CTX.record_subagent(label, sub_ctx)
         return "(no summary)"
 
     if hit_limit:
@@ -1173,9 +1221,12 @@ def run_subagent(prompt: str, mode: str = "execute", max_rounds: int = 30) -> st
             tools=[],
             max_tokens=8000,
         )
+        sub_ctx.update_usage(summary_response)
+        CTX.record_subagent(label, sub_ctx)
         text = "".join(b.text for b in summary_response.content if hasattr(b, "text"))
         return f"[INCOMPLETE - hit {max_rounds}-round limit]\n{text}" if text else "(forced stop, no summary)"
 
+    CTX.record_subagent(label, sub_ctx)
     return "".join(b.text for b in response.content if hasattr(b, "text")) or "(no summary)"
 
 
