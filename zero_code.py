@@ -30,6 +30,8 @@ SKILLS_DIR = WORKDIR / ".skills"
 
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 MODEL = os.environ["MODEL_ID"]
+su
+print(f"Work at {WORKDIR}. Model: {MODEL}")
 
 
 # ---------------------------------------------------------------------------
@@ -332,6 +334,7 @@ PARENT_TOOLS = BASE_TOOLS + [
 def run_subagent(prompt: str, max_rounds: int = 30) -> str:
     sub_messages = [{"role": "user", "content": prompt}]
     response = None
+    hit_limit = False
 
     for _ in range(max_rounds):
         response = client.messages.create(
@@ -346,6 +349,10 @@ def run_subagent(prompt: str, max_rounds: int = 30) -> str:
             "content": [block.model_dump() for block in response.content],
         }
         sub_messages.append(assistant_msg)
+
+        for block in response.content:
+            if hasattr(block, "text") and block.text:
+                print(f"  [subagent] {block.text[:300]}{'...' if len(block.text) > 300 else ''}")
 
         has_tool_use = any(
             getattr(block, "type", None) == "tool_use" for block in response.content
@@ -369,9 +376,35 @@ def run_subagent(prompt: str, max_rounds: int = 30) -> str:
                 "content": str(output)[:50000],
             })
         sub_messages.append({"role": "user", "content": results})
+    else:
+        hit_limit = True
 
     if response is None:
         return "(no summary)"
+
+    if hit_limit:
+        print(f"[subagent] hit {max_rounds}-round limit, forcing summary")
+        sub_messages.append({
+            "role": "user",
+            "content": (
+                f"You have reached the maximum of {max_rounds} tool-call rounds and must stop now.\n"
+                "Please summarize:\n"
+                "1) What you have accomplished so far\n"
+                "2) Key findings from your tool calls\n"
+                "3) What remains unfinished or uncertain\n"
+                "Be concise. Note clearly that this task may NOT be fully completed."
+            ),
+        })
+        summary_response = client.messages.create(
+            model=MODEL,
+            system=SUBAGENT_SYSTEM,
+            messages=sub_messages,
+            tools=[],
+            max_tokens=8000,
+        )
+        text = "".join(b.text for b in summary_response.content if hasattr(b, "text"))
+        return f"[INCOMPLETE - hit {max_rounds}-round limit]\n{text}" if text else "(forced stop, no summary)"
+
     return "".join(b.text for b in response.content if hasattr(b, "text")) or "(no summary)"
 
 
