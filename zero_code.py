@@ -24,6 +24,7 @@ from pathlib import Path
 
 import yaml
 from anthropic import Anthropic
+from anthropic.types import MessageParam
 from dotenv import load_dotenv
 from rich.console import Console
 from rich.panel import Panel
@@ -357,6 +358,11 @@ class ContextManager:
     def __init__(self):
         self.recent_files: list[str] = []
         self._file_counter = 0
+        self.last_input_tokens = 0
+        self.total_input_tokens = 0
+        self.total_output_tokens = 0
+        self.cache_read_tokens = 0
+        self.api_calls = 0
 
     def track_file(self, path: str):
         if path in self.recent_files:
@@ -364,16 +370,43 @@ class ContextManager:
         self.recent_files.append(path)
         self.recent_files = self.recent_files[-5:]
 
-    # -- token estimation ---------------------------------------------------
+    # -- token tracking -----------------------------------------------------
 
-    @staticmethod
-    def estimate_tokens(messages: list) -> int:
-        return len(json.dumps(messages, default=str, ensure_ascii=False)) // 4
+    def update_usage(self, response) -> dict:
+        """Extract usage from API response and accumulate totals. Returns usage dict."""
+        usage = response.usage
+        self.last_input_tokens = getattr(usage, "input_tokens", 0)
+        self.total_input_tokens += self.last_input_tokens
+        self.total_output_tokens += getattr(usage, "output_tokens", 0)
+        self.cache_read_tokens += getattr(usage, "cache_read_input_tokens", 0) or 0
+        self.api_calls += 1
+        return {
+            "input": self.last_input_tokens,
+            "output": getattr(usage, "output_tokens", 0),
+            "cache_read": getattr(usage, "cache_read_input_tokens", 0) or 0,
+            "total_in": self.total_input_tokens,
+            "total_out": self.total_output_tokens,
+            "calls": self.api_calls,
+        }
+
+    def usage_summary(self) -> str:
+        return (
+            f"input={self.last_input_tokens:,} | "
+            f"session: {self.total_input_tokens:,}in + {self.total_output_tokens:,}out | "
+            f"cache_read={self.cache_read_tokens:,} | "
+            f"calls={self.api_calls}"
+        )
+
+    def reset_usage(self):
+        """Reset after compaction."""
+        self.last_input_tokens = 0
 
     # -- microcompaction ----------------------------------------------------
 
     def microcompact(self, messages: list):
         """Offload old large tool outputs to disk, keep hot tail inline."""
+        tool_call_index = self._build_tool_call_index(messages)
+
         tool_result_indices = []
         for i, msg in enumerate(messages):
             if isinstance(msg.get("content"), list):
@@ -392,14 +425,49 @@ class ContextManager:
             if content.startswith("[tool output saved to"):
                 continue
             self._file_counter += 1
-            cache_path = CACHE_DIR / f"tool_{self._file_counter:05d}.txt"
-            cache_path.write_text(content)
-            block["content"] = f"[tool output saved to {cache_path.relative_to(WORKDIR)}, {len(content)} chars]"
+            cache_path = CACHE_DIR / f"tool_{self._file_counter:05d}.md"
+
+            tool_id = block.get("tool_use_id", "")
+            call_info = tool_call_index.get(tool_id, {})
+            tool_name = call_info.get("name", "unknown")
+            tool_input = call_info.get("input", {})
+            input_preview = json.dumps(tool_input, ensure_ascii=False, default=str)
+            if len(input_preview) > 500:
+                input_preview = input_preview[:497] + "..."
+
+            md = (
+                f"# Tool Call: {tool_name}\n\n"
+                f"**ID**: `{tool_id}`\n\n"
+                f"**Input**:\n```json\n{input_preview}\n```\n\n"
+                f"**Output** ({len(content)} chars):\n\n"
+                f"{content}\n"
+            )
+            cache_path.write_text(md)
+            block["content"] = f"[tool output saved to {cache_path.relative_to(WORKDIR)}, {tool_name}, {len(content)} chars]"
+
+    @staticmethod
+    def _build_tool_call_index(messages: list) -> dict:
+        """Build a mapping from tool_use_id -> {name, input} across all assistant messages."""
+        index = {}
+        for msg in messages:
+            if msg.get("role") != "assistant":
+                continue
+            content = msg.get("content", [])
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "tool_use":
+                    index[block.get("id", "")] = {
+                        "name": block.get("name", "unknown"),
+                        "input": block.get("input", {}),
+                    }
+        return index
 
     # -- auto compaction ----------------------------------------------------
 
-    def should_compact(self, messages: list) -> bool:
-        return self.estimate_tokens(messages) > COMPACT_THRESHOLD
+    def should_compact(self) -> bool:
+        """Check if context is approaching limit based on actual API token usage."""
+        return self.last_input_tokens > COMPACT_THRESHOLD
 
     def compact(self, messages: list, focus: str = None) -> list:
         """Summarize conversation and rehydrate with todo + recent files."""
@@ -413,23 +481,24 @@ class ContextManager:
         if focus:
             focus_instruction = f"\nFocus especially on: {focus}\n"
 
+        compact_messages: list[MessageParam] = [{
+            "role": "user",
+            "content": (
+                "Summarize this conversation for continuity. Include:\n"
+                "1) What was accomplished\n"
+                "2) Current state of the codebase and any in-progress work\n"
+                "3) Key technical decisions made and why\n"
+                "4) Open tasks and next steps\n"
+                "5) Errors encountered and how they were resolved\n"
+                "6) Files touched and why they matter\n"
+                f"{focus_instruction}"
+                "Be concise but preserve critical details needed to continue without re-asking.\n\n"
+                + conversation_text
+            ),
+        }]
         summary_response = client.messages.create(
             model=MODEL,
-            messages=[{
-                "role": "user",
-                "content": (
-                    "Summarize this conversation for continuity. Include:\n"
-                    "1) What was accomplished\n"
-                    "2) Current state of the codebase and any in-progress work\n"
-                    "3) Key technical decisions made and why\n"
-                    "4) Open tasks and next steps\n"
-                    "5) Errors encountered and how they were resolved\n"
-                    "6) Files touched and why they matter\n"
-                    f"{focus_instruction}"
-                    "Be concise but preserve critical details needed to continue without re-asking.\n\n"
-                    + conversation_text
-                ),
-            }],
+            messages=compact_messages,
             max_tokens=8000,
         )
         summary = summary_response.content[0].text
@@ -523,8 +592,7 @@ Before responding each turn, ask yourself:
 - Am I keeping changes minimal and focused?
 
 # Skills
-{SKILL_LOADER.get_descriptions()}
-{{{{ACTIVE_TODOS}}}}"""
+{SKILL_LOADER.get_descriptions()}"""
 
 SUBAGENT_SYSTEM = f"""\
 You are a coding subagent at {WORKDIR}.
@@ -1119,12 +1187,6 @@ MAX_AGENT_ROUNDS = 100
 RESULT_MAX_CHARS = 50000
 
 
-def _build_system_prompt() -> str:
-    """Build the system prompt with dynamic todo snapshot injected."""
-    todo_block = TODO.snapshot_for_prompt()
-    return SYSTEM.replace("{{ACTIVE_TODOS}}", todo_block)
-
-
 def _truncate_result(output: str) -> str:
     s = str(output)
     if len(s) <= RESULT_MAX_CHARS:
@@ -1147,24 +1209,31 @@ def agent_loop(messages: list) -> str:
         CTX.microcompact(messages)
 
         # -- auto-compaction: compress if approaching context limit
-        if CTX.should_compact(messages):
+        if CTX.should_compact():
             UI.console.print(f"[dim]{UI._ts()} [auto-compact triggered, saving transcript...][/dim]")
             messages[:] = CTX.compact(messages)
+            CTX.reset_usage()
 
-        # -- token estimate for UI
-        token_est = CTX.estimate_tokens(messages)
-        UI.console.print(f"[dim]{UI._ts()} round {round_idx+1}/{MAX_AGENT_ROUNDS} | ~{token_est:,} tokens[/dim]", end="\r")
-
-        # -- build system prompt with current todo state
-        system = _build_system_prompt()
+        # -- inject todo snapshot as ephemeral user message (cache-friendly)
+        todo_snap = TODO.snapshot_for_prompt()
+        if todo_snap:
+            messages.append({"role": "user", "content": todo_snap})
 
         response = client.messages.create(
             model=MODEL,
-            system=system,
+            system=SYSTEM,
             messages=messages,
             tools=PARENT_TOOLS,
             max_tokens=8000,
         )
+
+        # pop the ephemeral todo message before persisting assistant reply
+        if todo_snap:
+            messages.pop()
+
+        # -- track actual token usage from API response
+        usage = CTX.update_usage(response)
+        UI.console.print(f"[dim]{UI._ts()} round {round_idx+1}/{MAX_AGENT_ROUNDS} | {usage['input']:,}in {usage['output']:,}out | session: {usage['total_in']:,}+{usage['total_out']:,}[/dim]", end="\r")
 
         assistant_msg = {
             "role": "assistant",
@@ -1225,11 +1294,12 @@ def agent_loop(messages: list) -> str:
     })
     response = client.messages.create(
         model=MODEL,
-        system=_build_system_prompt(),
+        system=SYSTEM,
         messages=messages,
         tools=[],
         max_tokens=8000,
     )
+    CTX.update_usage(response)
     return f"[hit {MAX_AGENT_ROUNDS}-round limit]\n" + "\n".join(
         b.text for b in response.content if hasattr(b, "text")
     )
@@ -1259,13 +1329,16 @@ if __name__ == "__main__":
             focus = query.strip()[len("/compact"):].strip() or None
             UI.console.print(f"[dim]{UI._ts()} Compacting conversation...[/dim]")
             history[:] = CTX.compact(history, focus=focus)
-            UI.console.print(f"[dim]{UI._ts()} Done. Context compressed to ~{CTX.estimate_tokens(history):,} tokens.[/dim]")
+            CTX.reset_usage()
+            UI.console.print(f"[dim]{UI._ts()} Done. Context compacted. {len(history)} messages remaining.[/dim]")
             continue
 
         # -- /context command: show usage
         if stripped == "/context":
-            tokens = CTX.estimate_tokens(history)
-            UI.console.print(f"[dim]{UI._ts()} Context: ~{tokens:,} tokens, {len(history)} messages, threshold={COMPACT_THRESHOLD:,}[/dim]")
+            UI.console.print(
+                f"[dim]{UI._ts()} {CTX.usage_summary()}\n"
+                f"  messages={len(history)} | compact_threshold={COMPACT_THRESHOLD:,}[/dim]"
+            )
             continue
 
         history.append({"role": "user", "content": query})
