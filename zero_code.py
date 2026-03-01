@@ -57,6 +57,7 @@ class ConsoleUI:
         self.console = Console()
         self._tool_area_height = 0
         self._todo_area_height = 0
+        self._usage_area_height = 0
         self._current_todo = ""
         self._tool_buffer: list[str] = []
 
@@ -76,10 +77,11 @@ class ConsoleUI:
         sys.stdout.flush()
 
     def _clear_dynamic(self):
-        total = self._tool_area_height + self._todo_area_height
+        total = self._tool_area_height + self._todo_area_height + self._usage_area_height
         self._clear_up(total)
         self._tool_area_height = 0
         self._todo_area_height = 0
+        self._usage_area_height = 0
 
     # -- tool area ----------------------------------------------------------
 
@@ -117,9 +119,30 @@ class ConsoleUI:
         self._todo_area_height = self._measure(panel)
         self.console.print(panel)
 
+    def _render_usage(self):
+        """Render token usage panel from global CTX."""
+        try:
+            ctx = globals().get("CTX")
+            if ctx is None:
+                self._usage_area_height = 0
+                return
+            text = ctx.all_usage_summary()
+            panel = Panel(
+                Text(text),
+                title="[bold yellow]Token Usage[/bold yellow]",
+                subtitle=f"[dim]{self._ts()}[/dim]",
+                border_style="yellow",
+                padding=(0, 1),
+            )
+            self._usage_area_height = self._measure(panel)
+            self.console.print(panel)
+        except Exception:
+            self._usage_area_height = 0
+
     def _refresh(self):
         self._clear_dynamic()
         self._render_tool_panel()
+        self._render_usage()
         self._render_todo()
 
     def new_tool_cycle(self):
@@ -158,9 +181,11 @@ class ConsoleUI:
     # -- todo ---------------------------------------------------------------
 
     def update_todo(self, text: str):
-        self._clear_up(self._todo_area_height)
+        self._clear_up(self._todo_area_height + self._usage_area_height)
         self._todo_area_height = 0
+        self._usage_area_height = 0
         self._current_todo = text
+        self._render_usage()
         self._render_todo()
 
     # -- messages -----------------------------------------------------------
@@ -1386,10 +1411,14 @@ if __name__ == "__main__":
 
         # -- /context command: show usage
         if stripped == "/context":
-            UI.console.print(
-                f"[dim]{UI._ts()} {CTX.usage_summary()}\n"
-                f"  messages={len(history)} | compact_threshold={COMPACT_THRESHOLD:,}[/dim]"
+            usage_text = CTX.all_usage_summary()
+            panel = Panel(
+                Text(f"{usage_text}\nmessages={len(history)} | compact_threshold={COMPACT_THRESHOLD:,}"),
+                title="[bold yellow]Context & Token Usage[/bold yellow]",
+                border_style="yellow",
+                padding=(0, 1),
             )
+            UI.console.print(panel)
             continue
 
         history.append({"role": "user", "content": query})
