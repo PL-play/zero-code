@@ -37,7 +37,8 @@ if os.getenv("ANTHROPIC_BASE_URL"):
     os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
 
 WORKDIR = Path.cwd().resolve()
-SKILLS_DIR = WORKDIR / "skills"
+AGENT_DIR = Path(__file__).resolve().parent
+SKILLS_DIR = AGENT_DIR / ".skills"
 
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 MODEL = os.environ["MODEL_ID"]
@@ -214,12 +215,12 @@ class ConsoleUI:
         table.add_column(style="bold")
         table.add_column()
         table.add_row("Workspace", str(WORKDIR))
+        table.add_row("Agent Home", str(AGENT_DIR))
         table.add_row("Model", MODEL)
-        table.add_row("Exit", "type 'exit' or 'quit'")
         self.console.print(
             Panel(
                 table,
-                title="[bold blue]ZERO-CODE[/bold blue] [red]by zhangran[red]",
+                title="[bold blue]ZERO-CODE[/bold blue] [red]by Ran[red]",
                 border_style="blue",
                 padding=(1, 2),
             )
@@ -343,7 +344,7 @@ class SkillLoader:
         for name, skill in self.skills.items():
             desc = skill["meta"].get("description", "No description")
             tags = skill["meta"].get("tags", "")
-            rel_path = Path(skill["path"]).relative_to(WORKDIR)
+            rel_path = Path(skill["path"]).relative_to(AGENT_DIR)
             line = f"  - {name}: {desc} (path: {rel_path})"
             if tags:
                 line += f" [{tags}]"
@@ -354,7 +355,7 @@ class SkillLoader:
         skill = self.skills.get(name)
         if not skill:
             return f"Error: Unknown skill '{name}'. Available: {', '.join(self.skills.keys())}"
-        rel_path = Path(skill["path"]).relative_to(WORKDIR)
+        rel_path = Path(skill["path"]).relative_to(AGENT_DIR)
         return (
             f"<skill name=\"{name}\" path=\"{rel_path}\">\n"
             f"Source: {rel_path}\n\n"
@@ -365,11 +366,11 @@ class SkillLoader:
 
 SKILL_LOADER = SkillLoader(SKILLS_DIR)
 
-CACHE_DIR = WORKDIR / ".cache"
+CACHE_DIR = AGENT_DIR / ".cache"
 CACHE_DIR.mkdir(exist_ok=True)
 
 COMPACT_THRESHOLD = int(os.getenv("CONTEXT_COMPACT_THRESHOLD", "50000"))
-MICRO_HOT_TAIL = 4  # keep last N tool_result messages fully inline
+MICRO_HOT_TAIL = 10  # keep last N tool_result messages fully inline
 MICRO_SIZE_LIMIT = 1000  # offload tool outputs larger than this (chars)
 
 
@@ -505,7 +506,7 @@ class ContextManager:
                 f"{content}\n"
             )
             cache_path.write_text(md)
-            block["content"] = f"[tool output saved to {cache_path.relative_to(WORKDIR)}, {tool_name}, {len(content)} chars]"
+            block["content"] = f"[tool output saved to {cache_path.relative_to(AGENT_DIR)}, {tool_name}, {len(content)} chars]"
 
     @staticmethod
     def _build_tool_call_index(messages: list) -> dict:
@@ -571,7 +572,7 @@ class ContextManager:
         """Rebuild context after compaction: summary + todos + recent files."""
         parts = [
             "This session is being continued from a previous conversation that ran out of context.",
-            f"Transcript saved to: {transcript_path.relative_to(WORKDIR)}",
+            f"Transcript saved to: {transcript_path.relative_to(AGENT_DIR)}",
             "",
             summary,
         ]
@@ -1382,11 +1383,94 @@ def agent_loop(messages: list) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Slash commands registry
+# ---------------------------------------------------------------------------
+
+SLASH_COMMANDS = [
+    {"name": "/help",    "args": "",           "description": "Show available commands"},
+    {"name": "/compact", "args": "[focus]",    "description": "Compress conversation context (optional focus topic)"},
+    {"name": "/context", "args": "",           "description": "Show token usage and context stats"},
+    {"name": "/skills",  "args": "",           "description": "List loaded skills"},
+]
+
+
+def _handle_help(**_):
+    table = Table(show_header=True, border_style="blue", padding=(0, 1))
+    table.add_column("Command", style="bold cyan", no_wrap=True)
+    table.add_column("Description")
+    for cmd in SLASH_COMMANDS:
+        name_col = cmd["name"]
+        if cmd["args"]:
+            name_col += f" {cmd['args']}"
+        table.add_row(name_col, cmd["description"])
+    table.add_row("[dim]exit / quit / q[/dim]", "[dim]Exit the program[/dim]")
+    panel = Panel(
+        table,
+        title="[bold blue]Commands[/bold blue]",
+        border_style="blue",
+        padding=(0, 1),
+    )
+    UI.console.print(panel)
+
+
+def _handle_compact(raw_query: str, history: list):
+    focus = raw_query.strip()[len("/compact"):].strip() or None
+    UI.console.print(f"[dim]{UI._ts()} Compacting conversation...[/dim]")
+    history[:] = CTX.compact(history, focus=focus)
+    CTX.reset_usage()
+    UI.console.print(f"[dim]{UI._ts()} Done. Context compacted. {len(history)} messages remaining.[/dim]")
+
+
+def _handle_context(**_):
+    usage_text = CTX.all_usage_summary()
+    panel = Panel(
+        Text(f"{usage_text}\nmessages={len(_['history'])} | compact_threshold={COMPACT_THRESHOLD:,}"),
+        title="[bold yellow]Context & Token Usage[/bold yellow]",
+        border_style="yellow",
+        padding=(0, 1),
+    )
+    UI.console.print(panel)
+
+
+def _handle_skills(**_):
+    if not SKILL_LOADER.skills:
+        UI.console.print(f"[dim]{UI._ts()} No skills found in {SKILLS_DIR}/[/dim]")
+        return
+    table = Table(show_header=True, border_style="magenta", padding=(0, 1))
+    table.add_column("Name", style="bold cyan")
+    table.add_column("Description")
+    table.add_column("Tags", style="dim")
+    table.add_column("Path", style="dim")
+    for name, skill in SKILL_LOADER.skills.items():
+        desc = skill["meta"].get("description", "-")
+        tags = skill["meta"].get("tags", "-")
+        rel_path = str(Path(skill["path"]).relative_to(AGENT_DIR))
+        table.add_row(name, desc, str(tags), rel_path)
+    panel = Panel(
+        table,
+        title=f"[bold magenta]Skills[/bold magenta] [dim]({len(SKILL_LOADER.skills)} loaded)[/dim]",
+        subtitle=f"[dim]{SKILLS_DIR}/[/dim]",
+        border_style="magenta",
+        padding=(0, 1),
+    )
+    UI.console.print(panel)
+
+
+COMMAND_DISPATCH = {
+    "/help":    _handle_help,
+    "/compact": _handle_compact,
+    "/context": _handle_context,
+    "/skills":  _handle_skills,
+}
+
+
+# ---------------------------------------------------------------------------
 # CLI entry
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     UI.welcome()
+    _handle_help()
     history = []
     while True:
         try:
@@ -1400,25 +1484,14 @@ if __name__ == "__main__":
             UI.console.print("[dim]Bye.[/dim]")
             break
 
-        # -- /compact command
-        if stripped.startswith("/compact"):
-            focus = query.strip()[len("/compact"):].strip() or None
-            UI.console.print(f"[dim]{UI._ts()} Compacting conversation...[/dim]")
-            history[:] = CTX.compact(history, focus=focus)
-            CTX.reset_usage()
-            UI.console.print(f"[dim]{UI._ts()} Done. Context compacted. {len(history)} messages remaining.[/dim]")
-            continue
-
-        # -- /context command: show usage
-        if stripped == "/context":
-            usage_text = CTX.all_usage_summary()
-            panel = Panel(
-                Text(f"{usage_text}\nmessages={len(history)} | compact_threshold={COMPACT_THRESHOLD:,}"),
-                title="[bold yellow]Context & Token Usage[/bold yellow]",
-                border_style="yellow",
-                padding=(0, 1),
-            )
-            UI.console.print(panel)
+        if stripped.startswith("/"):
+            cmd_name = stripped.split()[0]
+            handler = COMMAND_DISPATCH.get(cmd_name)
+            if handler:
+                handler(raw_query=query, history=history)
+            else:
+                known = ", ".join(c["name"] for c in SLASH_COMMANDS)
+                UI.console.print(f"[dim]{UI._ts()}[/dim] [bold red]Unknown command:[/bold red] {cmd_name}  (available: {known})")
             continue
 
         history.append({"role": "user", "content": query})
