@@ -244,10 +244,14 @@ UI = ConsoleUI()
 # ---------------------------------------------------------------------------
 
 def safe_path(p: str) -> Path:
-    path = (WORKDIR / p).resolve()
-    if not path.is_relative_to(WORKDIR):
-        raise ValueError(f"Path escapes workspace: {p}")
-    return path
+    raw = Path(p)
+    if raw.is_absolute():
+        path = raw.resolve()
+    else:
+        path = (WORKDIR / p).resolve()
+    if path.is_relative_to(WORKDIR) or path.is_relative_to(AGENT_DIR):
+        return path
+    raise ValueError(f"Path escapes allowed directories: {p}")
 
 
 # ---------------------------------------------------------------------------
@@ -344,8 +348,7 @@ class SkillLoader:
         for name, skill in self.skills.items():
             desc = skill["meta"].get("description", "No description")
             tags = skill["meta"].get("tags", "")
-            rel_path = Path(skill["path"]).relative_to(AGENT_DIR)
-            line = f"  - {name}: {desc} (path: {rel_path})"
+            line = f"  - {name}: {desc} (path: {skill['path']})"
             if tags:
                 line += f" [{tags}]"
             lines.append(line)
@@ -355,10 +358,9 @@ class SkillLoader:
         skill = self.skills.get(name)
         if not skill:
             return f"Error: Unknown skill '{name}'. Available: {', '.join(self.skills.keys())}"
-        rel_path = Path(skill["path"]).relative_to(AGENT_DIR)
         return (
-            f"<skill name=\"{name}\" path=\"{rel_path}\">\n"
-            f"Source: {rel_path}\n\n"
+            f"<skill name=\"{name}\" path=\"{skill['path']}\">\n"
+            f"Source: {skill['path']}\n\n"
             f"{skill['body']}\n"
             f"</skill>"
         )
@@ -656,6 +658,8 @@ Before responding each turn, ask yourself:
 - Am I keeping changes minimal and focused?
 
 # Skills
+Agent home directory: {AGENT_DIR}
+Skills and cache are stored under the agent home, NOT the workspace. Use load_skill(name) to load a skill by name — it reads from agent home directly.
 {SKILL_LOADER.get_descriptions()}"""
 
 SUBAGENT_SYSTEM = f"""\
