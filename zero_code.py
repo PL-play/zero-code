@@ -1,24 +1,30 @@
 #!/usr/bin/env python3
 """
-zero_code.py - Single-file CLI code agent.
+zero_code.py - Single-file CLI code agent with rich console UI.
 
 Features:
 - 4 base tools: bash, read_file, write_file, edit_file
 - TodoManager: structured task tracking with nag reminder
-- SkillLoader: two-layer skill injection (metadata in system prompt, body on demand)
+- SkillLoader: two-layer skill injection
 - Subagent: fresh-context child agent for delegation
-- Agent loop (while + tool_use dispatch)
-- CLI entry point
+- Rich console UI: tool area (fixed height, auto-clear), persistent todo panel, timestamps
 """
 
 import os
 import re
 import subprocess
+import sys
+from datetime import datetime
+from io import StringIO
 from pathlib import Path
 
 import yaml
 from anthropic import Anthropic
 from dotenv import load_dotenv
+from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
+from rich.text import Text
 
 load_dotenv(override=True)
 
@@ -26,12 +32,180 @@ if os.getenv("ANTHROPIC_BASE_URL"):
     os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
 
 WORKDIR = Path.cwd().resolve()
-SKILLS_DIR = WORKDIR / ".skills"
+SKILLS_DIR = WORKDIR / "skills"
 
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 MODEL = os.environ["MODEL_ID"]
-su
-print(f"Work at {WORKDIR}. Model: {MODEL}")
+
+
+# ---------------------------------------------------------------------------
+# Console UI
+# ---------------------------------------------------------------------------
+
+TOOL_MAX_LINES = 20
+
+
+class ConsoleUI:
+    """Rich terminal UI with replaceable tool area and persistent todo panel."""
+
+    def __init__(self):
+        self.console = Console()
+        self._tool_area_height = 0
+        self._todo_area_height = 0
+        self._current_todo = ""
+        self._tool_buffer: list[str] = []
+
+    @staticmethod
+    def _ts() -> str:
+        return datetime.now().strftime("%H:%M:%S")
+
+    def _measure(self, renderable) -> int:
+        buf = StringIO()
+        Console(file=buf, width=self.console.width, no_color=True).print(renderable)
+        return buf.getvalue().count("\n")
+
+    def _clear_up(self, n: int):
+        if n <= 0:
+            return
+        sys.stdout.write(f"\033[{n}A\033[J")
+        sys.stdout.flush()
+
+    def _clear_dynamic(self):
+        total = self._tool_area_height + self._todo_area_height
+        self._clear_up(total)
+        self._tool_area_height = 0
+        self._todo_area_height = 0
+
+    # -- tool area ----------------------------------------------------------
+
+    def _render_tool_panel(self):
+        if not self._tool_buffer:
+            return
+        visible = self._tool_buffer[-TOOL_MAX_LINES:]
+        if len(self._tool_buffer) > TOOL_MAX_LINES:
+            hidden = len(self._tool_buffer) - TOOL_MAX_LINES
+            body_text = f"  ... {hidden} lines above ...\n" + "\n".join(visible)
+        else:
+            body_text = "\n".join(visible)
+
+        panel = Panel(
+            Text(body_text),
+            title=f"[bold cyan]Tools[/bold cyan] [dim]({len(self._tool_buffer)} entries)[/dim]",
+            subtitle=f"[dim]{self._ts()}[/dim]",
+            border_style="cyan",
+            padding=(0, 1),
+        )
+        self._tool_area_height = self._measure(panel)
+        self.console.print(panel)
+
+    def _render_todo(self):
+        if not self._current_todo or self._current_todo == "No todos.":
+            self._todo_area_height = 0
+            return
+        panel = Panel(
+            Text(self._current_todo),
+            title="[bold green]TODO[/bold green]",
+            subtitle=f"[dim]{self._ts()}[/dim]",
+            border_style="green",
+            padding=(0, 1),
+        )
+        self._todo_area_height = self._measure(panel)
+        self.console.print(panel)
+
+    def _refresh(self):
+        self._clear_dynamic()
+        self._render_tool_panel()
+        self._render_todo()
+
+    def new_tool_cycle(self):
+        self._tool_buffer = []
+
+    def tool_call(self, name: str, output: str, is_sub: bool = False):
+        ts = self._ts()
+        prefix = "  sub" if is_sub else "    "
+        out_preview = output.replace("\n", " ")
+        if len(out_preview) > 120:
+            out_preview = out_preview[:117] + "..."
+        entry = f"{ts} {prefix} {name}: {out_preview}"
+        self._tool_buffer.append(entry)
+        self._refresh()
+
+    def task_start(self, desc: str, prompt_preview: str):
+        ts = self._ts()
+        if len(prompt_preview) > 100:
+            prompt_preview = prompt_preview[:97] + "..."
+        self._tool_buffer.append(f"{ts}      sub_agent ({desc}): {prompt_preview}")
+        self._refresh()
+
+    def subagent_text(self, text: str):
+        ts = self._ts()
+        preview = text.replace("\n", " ")
+        if len(preview) > 120:
+            preview = preview[:117] + "..."
+        self._tool_buffer.append(f"{ts}   sub> {preview}")
+        self._refresh()
+
+    def subagent_limit(self, max_rounds: int):
+        ts = self._ts()
+        self._tool_buffer.append(f"{ts}   sub> [hit {max_rounds}-round limit, forcing summary]")
+        self._refresh()
+
+    # -- todo ---------------------------------------------------------------
+
+    def update_todo(self, text: str):
+        self._clear_up(self._todo_area_height)
+        self._todo_area_height = 0
+        self._current_todo = text
+        self._render_todo()
+
+    # -- messages -----------------------------------------------------------
+
+    def show_reply(self, text: str):
+        self._clear_dynamic()
+        self._tool_buffer = []
+        self._current_todo = ""
+        self.console.print()
+        panel = Panel(
+            text,
+            title=f"[bold blue]agent[/bold blue]",
+            subtitle=f"[dim]{self._ts()}[/dim]",
+            border_style="blue",
+            padding=(0, 1),
+        )
+        self.console.print(panel)
+        self.console.print()
+
+    def get_input(self) -> str:
+        return self.console.input(f"[dim]{self._ts()}[/dim] [bold green]you>[/bold green] ")
+
+    def welcome(self):
+        self.console.print()
+        table = Table(show_header=False, border_style="blue", padding=(0, 1))
+        table.add_column(style="bold")
+        table.add_column()
+        table.add_row("Workspace", str(WORKDIR))
+        table.add_row("Model", MODEL)
+        table.add_row("Exit", "type 'exit' or 'quit'")
+        self.console.print(
+            Panel(
+                table,
+                title="[bold blue]zero-code[/bold blue]",
+                border_style="blue",
+                padding=(1, 2),
+            )
+        )
+        self.console.print()
+
+    def error(self, text: str):
+        self.console.print(f"[dim]{self._ts()}[/dim] [bold red]error:[/bold red] {text}")
+
+    def nag_reminder(self):
+        ts = self._ts()
+        self._tool_buffer.append(f"{ts}      [reminder: update your todos]")
+        self._refresh()
+
+
+UI = ConsoleUI()
 
 
 # ---------------------------------------------------------------------------
@@ -72,7 +246,9 @@ class TodoManager:
         if in_progress_count > 1:
             raise ValueError("Only one task can be in_progress at a time")
         self.items = validated
-        return self.render()
+        result = self.render()
+        UI.update_todo(result)
+        return result
 
     def render(self) -> str:
         if not self.items:
@@ -352,7 +528,7 @@ def run_subagent(prompt: str, max_rounds: int = 30) -> str:
 
         for block in response.content:
             if hasattr(block, "text") and block.text:
-                print(f"  [subagent] {block.text[:300]}{'...' if len(block.text) > 300 else ''}")
+                UI.subagent_text(block.text)
 
         has_tool_use = any(
             getattr(block, "type", None) == "tool_use" for block in response.content
@@ -369,7 +545,7 @@ def run_subagent(prompt: str, max_rounds: int = 30) -> str:
                 output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
             except Exception as e:
                 output = f"Error: {e}"
-            print(f"  [sub] {block.name}: {str(output)[:120]}")
+            UI.tool_call(block.name, output, is_sub=True)
             results.append({
                 "type": "tool_result",
                 "tool_use_id": block.id,
@@ -383,7 +559,7 @@ def run_subagent(prompt: str, max_rounds: int = 30) -> str:
         return "(no summary)"
 
     if hit_limit:
-        print(f"[subagent] hit {max_rounds}-round limit, forcing summary")
+        UI.subagent_limit(max_rounds)
         sub_messages.append({
             "role": "user",
             "content": (
@@ -414,10 +590,12 @@ def run_subagent(prompt: str, max_rounds: int = 30) -> str:
 
 def agent_loop(messages: list) -> str:
     rounds_since_todo = 0
+    UI.new_tool_cycle()
 
     while True:
         if rounds_since_todo >= 8:
             messages.append({"role": "user", "content": "<reminder>Update your todos.</reminder>"})
+            UI.nag_reminder()
 
         response = client.messages.create(
             model=MODEL,
@@ -450,7 +628,7 @@ def agent_loop(messages: list) -> str:
 
             if block.name == "sub_agent":
                 desc = block.input.get("description", "subtask")
-                print(f"> task ({desc}): {block.input['prompt'][:80]}")
+                UI.task_start(desc, block.input["prompt"])
                 output = run_subagent(block.input["prompt"])
             else:
                 handler = TOOL_HANDLERS.get(block.name)
@@ -459,7 +637,7 @@ def agent_loop(messages: list) -> str:
                 except Exception as e:
                     output = f"Error: {e}"
 
-            print(f"> {block.name}: {str(output)[:200]}")
+            UI.tool_call(block.name, output)
             results.append({
                 "type": "tool_result",
                 "tool_use_id": block.id,
@@ -477,16 +655,21 @@ def agent_loop(messages: list) -> str:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    UI.welcome()
     history = []
-    print("zero-code CLI ready. Type 'exit' to quit.")
     while True:
         try:
-            query = input("\033[36mzero> \033[0m")
+            query = UI.get_input()
         except (EOFError, KeyboardInterrupt):
+            UI.console.print("\n[dim]Bye.[/dim]")
             break
-        if query.strip().lower() in ("q", "exit", ""):
+        if query.strip().lower() in ("q", "exit", "quit", ""):
+            UI.console.print("[dim]Bye.[/dim]")
             break
         history.append({"role": "user", "content": query})
-        reply = agent_loop(history)
-        print(reply)
-        print()
+        try:
+            reply = agent_loop(history)
+        except Exception as exc:
+            UI.error(str(exc))
+            continue
+        UI.show_reply(reply)
