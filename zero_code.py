@@ -13,7 +13,6 @@ Features:
 import os
 import queue
 import re
-import shutil
 import subprocess
 import sys
 import threading
@@ -192,7 +191,7 @@ class ConsoleUI:
         self.console.print(
             Panel(
                 table,
-                title="[bold blue]zero-code[/bold blue]",
+                title="[bold blue]ZERO-CODE[/bold blue] [red]by zhangran[red]",
                 border_style="blue",
                 padding=(1, 2),
             )
@@ -645,17 +644,23 @@ def run_glob(pattern: str, path: str = ".") -> str:
 def run_grep(pattern: str, path: str = ".", include: str = None, max_results: int = 50) -> str:
     try:
         base = safe_path(path)
-        if shutil.which("rg"):
-            cmd = ["rg", "--no-heading", "--line-number", "--max-count", str(max_results), pattern, str(base)]
-            if include:
-                cmd.extend(["--glob", include])
+        cmd = ["rg", "--no-heading", "--line-number", "--max-count", str(max_results), pattern, str(base)]
+        if include:
+            cmd.extend(["--glob", include])
+
+        try:
             r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            # rg: 0=matched, 1=no matches, 2=error (invalid regex, etc.)
+            if r.returncode > 1:
+                err = r.stderr.strip() or "rg failed"
+                return f"Error: {err}"
             out = r.stdout.strip()
             if not out:
                 return f"No matches for '{pattern}'"
             lines = out.splitlines()[:max_results]
             return "\n".join(lines)
-        else:
+        except FileNotFoundError:
+            # Fallback when ripgrep is unavailable.
             compiled = re.compile(pattern)
             results = []
             search_dir = base if base.is_dir() else base.parent
