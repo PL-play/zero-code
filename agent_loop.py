@@ -8,7 +8,7 @@ class ZeroCodeAgent:
         normalized = user_text.strip()
         if not normalized:
             return "请输入内容，我再继续。"
-        return f"[v0占位回复] 收到你的请求：{normalized}"
+        return f"[zero-code v0.1] 收到你的请求：{normalized}"
 
 
 def run_cli() -> None:
