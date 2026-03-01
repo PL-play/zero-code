@@ -10,12 +10,14 @@ Features:
 - Rich console UI: tool area (fixed height, auto-clear), persistent todo panel, timestamps
 """
 
+import json
 import os
 import queue
 import re
 import subprocess
 import sys
 import threading
+import time
 from datetime import datetime
 from io import StringIO
 from pathlib import Path
@@ -263,6 +265,16 @@ class TodoManager:
         lines.append(f"\n({done}/{len(self.items)} completed)")
         return "\n".join(lines)
 
+    def snapshot_for_prompt(self) -> str:
+        """Return a block to inject into the system prompt each turn."""
+        if not self.items:
+            return ""
+        return f"\n<current_todos>\n{self.render()}\n</current_todos>"
+
+    @property
+    def has_in_progress(self) -> bool:
+        return any(item["status"] == "in_progress" for item in self.items)
+
 
 TODO = TodoManager()
 
@@ -327,28 +339,209 @@ class SkillLoader:
 
 SKILL_LOADER = SkillLoader(SKILLS_DIR)
 
+CACHE_DIR = WORKDIR / ".cache"
+CACHE_DIR.mkdir(exist_ok=True)
+
+COMPACT_THRESHOLD = int(os.getenv("CONTEXT_COMPACT_THRESHOLD", "50000"))
+MICRO_HOT_TAIL = 4  # keep last N tool_result messages fully inline
+MICRO_SIZE_LIMIT = 1000  # offload tool outputs larger than this (chars)
+
+
+# ---------------------------------------------------------------------------
+# ContextManager — three-layer compaction
+# ---------------------------------------------------------------------------
+
+class ContextManager:
+    """Microcompact + auto-compact + manual-compact with rehydration."""
+
+    def __init__(self):
+        self.recent_files: list[str] = []
+        self._file_counter = 0
+
+    def track_file(self, path: str):
+        if path in self.recent_files:
+            self.recent_files.remove(path)
+        self.recent_files.append(path)
+        self.recent_files = self.recent_files[-5:]
+
+    # -- token estimation ---------------------------------------------------
+
+    @staticmethod
+    def estimate_tokens(messages: list) -> int:
+        return len(json.dumps(messages, default=str, ensure_ascii=False)) // 4
+
+    # -- microcompaction ----------------------------------------------------
+
+    def microcompact(self, messages: list):
+        """Offload old large tool outputs to disk, keep hot tail inline."""
+        tool_result_indices = []
+        for i, msg in enumerate(messages):
+            if isinstance(msg.get("content"), list):
+                for block in msg["content"]:
+                    if isinstance(block, dict) and block.get("type") == "tool_result":
+                        content = block.get("content", "")
+                        if isinstance(content, str) and len(content) > MICRO_SIZE_LIMIT:
+                            tool_result_indices.append((i, block))
+
+        if len(tool_result_indices) <= MICRO_HOT_TAIL:
+            return
+
+        cold = tool_result_indices[:-MICRO_HOT_TAIL]
+        for _, block in cold:
+            content = block["content"]
+            if content.startswith("[tool output saved to"):
+                continue
+            self._file_counter += 1
+            cache_path = CACHE_DIR / f"tool_{self._file_counter:05d}.txt"
+            cache_path.write_text(content)
+            block["content"] = f"[tool output saved to {cache_path.relative_to(WORKDIR)}, {len(content)} chars]"
+
+    # -- auto compaction ----------------------------------------------------
+
+    def should_compact(self, messages: list) -> bool:
+        return self.estimate_tokens(messages) > COMPACT_THRESHOLD
+
+    def compact(self, messages: list, focus: str = None) -> list:
+        """Summarize conversation and rehydrate with todo + recent files."""
+        transcript_path = CACHE_DIR / f"transcript_{int(time.time())}.jsonl"
+        with open(transcript_path, "w", encoding="utf-8") as f:
+            for msg in messages:
+                f.write(json.dumps(msg, default=str, ensure_ascii=False) + "\n")
+
+        conversation_text = json.dumps(messages, default=str, ensure_ascii=False)[:80000]
+        focus_instruction = ""
+        if focus:
+            focus_instruction = f"\nFocus especially on: {focus}\n"
+
+        summary_response = client.messages.create(
+            model=MODEL,
+            messages=[{
+                "role": "user",
+                "content": (
+                    "Summarize this conversation for continuity. Include:\n"
+                    "1) What was accomplished\n"
+                    "2) Current state of the codebase and any in-progress work\n"
+                    "3) Key technical decisions made and why\n"
+                    "4) Open tasks and next steps\n"
+                    "5) Errors encountered and how they were resolved\n"
+                    "6) Files touched and why they matter\n"
+                    f"{focus_instruction}"
+                    "Be concise but preserve critical details needed to continue without re-asking.\n\n"
+                    + conversation_text
+                ),
+            }],
+            max_tokens=8000,
+        )
+        summary = summary_response.content[0].text
+        return self._rehydrate(summary, transcript_path)
+
+    def _rehydrate(self, summary: str, transcript_path: Path) -> list:
+        """Rebuild context after compaction: summary + todos + recent files."""
+        parts = [
+            "This session is being continued from a previous conversation that ran out of context.",
+            f"Transcript saved to: {transcript_path.relative_to(WORKDIR)}",
+            "",
+            summary,
+        ]
+
+        todo_state = TODO.render()
+        if todo_state and todo_state != "No todos.":
+            parts.append(f"\n<current_todos>\n{todo_state}\n</current_todos>")
+
+        if self.recent_files:
+            parts.append(f"\nRecently accessed files: {', '.join(self.recent_files)}")
+
+        parts.append("\nPlease continue from where we left off without asking the user any further questions.")
+
+        return [
+            {"role": "user", "content": "\n".join(parts)},
+            {"role": "assistant", "content": "Understood. I have the context from the summary and will continue the task."},
+        ]
+
+
+CTX = ContextManager()
+
 
 # ---------------------------------------------------------------------------
 # System prompts
 # ---------------------------------------------------------------------------
 
-SYSTEM = f"""You are a coding agent at {WORKDIR}.
+SYSTEM = f"""\
+You are an interactive CLI coding agent working at {WORKDIR}.
 
-Tool tips:
-- bash: persistent session — cwd and env vars survive across calls. Use restart=true to reset.
-- read_file: returns lines with numbers (e.g. "  1|code"). Use offset/limit for large files. Pass a directory path to list its contents.
-- edit_file: str_replace (old_text->new_text) or insert (insert_line+insert_text). old_text must be unique; use more context if ambiguous.
-- glob/grep: prefer these over bash for searching files.
-- load_skill: access specialized knowledge before tackling unfamiliar topics.
-- sub_agent: delegate exploration or subtasks to a subagent with fresh context.
-- todo: plan multi-step tasks. Mark in_progress before starting, completed when done.
+# Identity
+You assist the user with software engineering tasks: fixing bugs, adding features, refactoring, explaining code, and more.
+Model: {MODEL}
 
-Skills available:
-{SKILL_LOADER.get_descriptions()}"""
+# Tone and Style
+- Output is displayed in a terminal. Be concise and direct; use markdown sparingly.
+- Only use emojis if the user explicitly asks.
+- Prioritize technical accuracy over validating the user's beliefs. Respectful correction is more valuable than false agreement.
+- Never propose changes to code you haven't read. Always read first, then modify.
+- Avoid over-engineering. Only make changes directly requested or clearly necessary.
+  - Don't add features, refactoring, comments, or type annotations beyond what was asked.
+  - Don't add error handling for scenarios that can't happen.
+  - Don't create abstractions for one-time operations. Three similar lines are better than a premature abstraction.
 
-SUBAGENT_SYSTEM = f"""You are a coding subagent at {WORKDIR}.
-Use glob/grep to search, read_file to read, load_skill for specialized knowledge.
-Complete the given task, then summarize your findings."""
+# Workflow
+1. Understand: read relevant files before acting. Use glob/grep to find files, not bash.
+2. Plan: for multi-step tasks (3+ steps), create a todo list FIRST. Break complex tasks into concrete, actionable items.
+3. Execute: work through items one at a time. Mark each in_progress before starting, completed immediately when done — never batch updates.
+4. Verify: after edits, use bash to run tests or linters when appropriate. Check your work.
+5. Delegate: use sub_agent(mode="explore") for codebase exploration, sub_agent(mode="execute") for independent subtasks. Keep the main agent focused on orchestration for large tasks.
+
+# Tool Usage
+- bash: persistent session — cwd and env vars survive across calls. Use restart=true to reset. Avoid dangerous commands (rm -rf /, sudo, etc.).
+- read_file: returns numbered lines ("  1|code"). Use offset/limit for large files. Pass a directory path to list contents. Always read before editing.
+- write_file: creates parent dirs automatically. Use for new files only; prefer edit_file for existing files.
+- edit_file: str_replace (old_text→new_text) or insert (insert_line+insert_text). old_text must be unique in the file — include more surrounding context if ambiguous. Returns context around the change so you can verify.
+- glob: find files by pattern (e.g. "*.py", "**/*.ts"). Prefer over `bash find`.
+- grep: search file contents by regex. Prefer over `bash grep/rg`. Supports include filter.
+- load_skill: load specialized knowledge before tackling unfamiliar domains. Check available skills first.
+- sub_agent: delegate to a child agent with fresh context. Use mode="explore" for read-only investigation, mode="execute" for tasks that modify files.
+- todo: track multi-step tasks. Keep exactly one item in_progress at a time.
+
+# Todo Discipline
+- Use the todo tool for any task with 3+ steps. This is mandatory, not optional.
+- Mark a todo in_progress BEFORE you start working on it.
+- Mark it completed IMMEDIATELY when done — do not wait to batch multiple completions.
+- Only one item should be in_progress at any time.
+- Review your todo list regularly to decide what to do next.
+
+# Delegation Guidelines
+Use sub_agent when:
+- There are 2+ independent subtasks that don't depend on each other.
+- Work involves cross-file investigation or comparison.
+- You need to explore unfamiliar parts of the codebase (use mode="explore").
+Keep the main agent focused on planning, integration, and quality checks.
+
+# Per-Turn Checklist
+Before responding each turn, ask yourself:
+- Have I updated my todo state?
+- Is there independent work I should delegate via sub_agent?
+- Am I reading before editing?
+- Am I keeping changes minimal and focused?
+
+# Skills
+{SKILL_LOADER.get_descriptions()}
+{{{{ACTIVE_TODOS}}}}"""
+
+SUBAGENT_SYSTEM = f"""\
+You are a coding subagent at {WORKDIR}.
+You have full read/write access to the workspace. Complete the given task thoroughly, then summarize:
+1) What you accomplished
+2) Key findings with specific file paths and line numbers
+3) Any issues or uncertainties
+Be concise and evidence-based."""
+
+EXPLORE_SUBAGENT_SYSTEM = f"""\
+You are a read-only exploration subagent at {WORKDIR}.
+You can search and read files but CANNOT modify them. Your job is to investigate and report.
+Use glob/grep to find files, read_file to examine them, load_skill for domain knowledge.
+Return a concise summary with:
+1) Key findings with specific file paths and line numbers
+2) Relevant code snippets or patterns discovered
+3) Any uncertainties or areas needing further investigation"""
 
 
 # ---------------------------------------------------------------------------
@@ -792,16 +985,18 @@ BASE_TOOLS = [
 ]
 
 CHILD_TOOLS = BASE_TOOLS
+EXPLORE_TOOLS = [t for t in BASE_TOOLS if t["name"] not in ("write_file", "edit_file")]
 
 PARENT_TOOLS = BASE_TOOLS + [
     {
         "name": "sub_agent",
-        "description": "Spawn a subagent with fresh context. It shares the filesystem but not conversation history.",
+        "description": "Spawn a subagent with fresh context. mode='explore' for read-only investigation, mode='execute' for tasks that modify files.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "prompt": {"type": "string"},
                 "description": {"type": "string", "description": "Short label for logging"},
+                "mode": {"type": "string", "enum": ["explore", "execute"], "description": "explore=read-only, execute=read-write (default: execute)"},
             },
             "required": ["prompt"],
         },
@@ -835,7 +1030,11 @@ PARENT_TOOLS = BASE_TOOLS + [
 # Subagent
 # ---------------------------------------------------------------------------
 
-def run_subagent(prompt: str, max_rounds: int = 30) -> str:
+def run_subagent(prompt: str, mode: str = "execute", max_rounds: int = 30) -> str:
+    is_explore = mode == "explore"
+    tools = EXPLORE_TOOLS if is_explore else CHILD_TOOLS
+    sys_prompt = EXPLORE_SUBAGENT_SYSTEM if is_explore else SUBAGENT_SYSTEM
+
     sub_messages = [{"role": "user", "content": prompt}]
     response = None
     hit_limit = False
@@ -843,9 +1042,9 @@ def run_subagent(prompt: str, max_rounds: int = 30) -> str:
     for _ in range(max_rounds):
         response = client.messages.create(
             model=MODEL,
-            system=SUBAGENT_SYSTEM,
+            system=sys_prompt,
             messages=sub_messages,
-            tools=CHILD_TOOLS,
+            tools=tools,
             max_tokens=8000,
         )
         assistant_msg = {
@@ -901,7 +1100,7 @@ def run_subagent(prompt: str, max_rounds: int = 30) -> str:
         })
         summary_response = client.messages.create(
             model=MODEL,
-            system=SUBAGENT_SYSTEM,
+            system=sys_prompt,
             messages=sub_messages,
             tools=[],
             max_tokens=8000,
@@ -916,18 +1115,52 @@ def run_subagent(prompt: str, max_rounds: int = 30) -> str:
 # Agent loop
 # ---------------------------------------------------------------------------
 
+MAX_AGENT_ROUNDS = 100
+RESULT_MAX_CHARS = 50000
+
+
+def _build_system_prompt() -> str:
+    """Build the system prompt with dynamic todo snapshot injected."""
+    todo_block = TODO.snapshot_for_prompt()
+    return SYSTEM.replace("{{ACTIVE_TODOS}}", todo_block)
+
+
+def _truncate_result(output: str) -> str:
+    s = str(output)
+    if len(s) <= RESULT_MAX_CHARS:
+        return s
+    return s[:RESULT_MAX_CHARS - 50] + f"\n... (truncated, {len(s)} total chars)"
+
+
 def agent_loop(messages: list) -> str:
     rounds_since_todo = 0
     UI.new_tool_cycle()
 
-    while True:
-        if rounds_since_todo >= 8:
-            messages.append({"role": "user", "content": "<reminder>Update your todos.</reminder>"})
+    for round_idx in range(MAX_AGENT_ROUNDS):
+        # -- nag: only when todos exist with in_progress and no updates for 5 rounds
+        if rounds_since_todo >= 5 and TODO.has_in_progress:
+            messages.append({"role": "user", "content": "<reminder>You have an in_progress todo. Update your todos.</reminder>"})
             UI.nag_reminder()
+            rounds_since_todo = 0
+
+        # -- microcompaction: offload old large tool outputs
+        CTX.microcompact(messages)
+
+        # -- auto-compaction: compress if approaching context limit
+        if CTX.should_compact(messages):
+            UI.console.print(f"[dim]{UI._ts()} [auto-compact triggered, saving transcript...][/dim]")
+            messages[:] = CTX.compact(messages)
+
+        # -- token estimate for UI
+        token_est = CTX.estimate_tokens(messages)
+        UI.console.print(f"[dim]{UI._ts()} round {round_idx+1}/{MAX_AGENT_ROUNDS} | ~{token_est:,} tokens[/dim]", end="\r")
+
+        # -- build system prompt with current todo state
+        system = _build_system_prompt()
 
         response = client.messages.create(
             model=MODEL,
-            system=SYSTEM,
+            system=system,
             messages=messages,
             tools=PARENT_TOOLS,
             max_tokens=8000,
@@ -956,8 +1189,9 @@ def agent_loop(messages: list) -> str:
 
             if block.name == "sub_agent":
                 desc = block.input.get("description", "subtask")
+                sub_mode = block.input.get("mode", "execute")
                 UI.task_start(desc, block.input["prompt"])
-                output = run_subagent(block.input["prompt"])
+                output = run_subagent(block.input["prompt"], mode=sub_mode)
             else:
                 handler = TOOL_HANDLERS.get(block.name)
                 try:
@@ -965,17 +1199,40 @@ def agent_loop(messages: list) -> str:
                 except Exception as e:
                     output = f"Error: {e}"
 
+            # track file access for rehydration
+            if block.name == "read_file":
+                CTX.track_file(block.input.get("path", ""))
+
             UI.tool_call(block.name, output)
             results.append({
                 "type": "tool_result",
                 "tool_use_id": block.id,
-                "content": str(output)[:50000],
+                "content": _truncate_result(output),
             })
             if block.name == "todo":
                 used_todo = True
 
         rounds_since_todo = 0 if used_todo else rounds_since_todo + 1
         messages.append({"role": "user", "content": results})
+
+    # -- hit max rounds: force a summary
+    messages.append({
+        "role": "user",
+        "content": (
+            f"You have reached the maximum of {MAX_AGENT_ROUNDS} rounds. "
+            "Summarize what you accomplished and what remains."
+        ),
+    })
+    response = client.messages.create(
+        model=MODEL,
+        system=_build_system_prompt(),
+        messages=messages,
+        tools=[],
+        max_tokens=8000,
+    )
+    return f"[hit {MAX_AGENT_ROUNDS}-round limit]\n" + "\n".join(
+        b.text for b in response.content if hasattr(b, "text")
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -991,9 +1248,26 @@ if __name__ == "__main__":
         except (EOFError, KeyboardInterrupt):
             UI.console.print("\n[dim]Bye.[/dim]")
             break
-        if query.strip().lower() in ("q", "exit", "quit", ""):
+
+        stripped = query.strip().lower()
+        if stripped in ("q", "exit", "quit", ""):
             UI.console.print("[dim]Bye.[/dim]")
             break
+
+        # -- /compact command
+        if stripped.startswith("/compact"):
+            focus = query.strip()[len("/compact"):].strip() or None
+            UI.console.print(f"[dim]{UI._ts()} Compacting conversation...[/dim]")
+            history[:] = CTX.compact(history, focus=focus)
+            UI.console.print(f"[dim]{UI._ts()} Done. Context compressed to ~{CTX.estimate_tokens(history):,} tokens.[/dim]")
+            continue
+
+        # -- /context command: show usage
+        if stripped == "/context":
+            tokens = CTX.estimate_tokens(history)
+            UI.console.print(f"[dim]{UI._ts()} Context: ~{tokens:,} tokens, {len(history)} messages, threshold={COMPACT_THRESHOLD:,}[/dim]")
+            continue
+
         history.append({"role": "user", "content": query})
         try:
             reply = agent_loop(history)
