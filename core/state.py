@@ -155,6 +155,11 @@ class TUIAdapter:
         entry = f"[{ts}] error: {text}"
         self._safe_dispatch("agent_log", f"[bold red]{entry}[/bold red]")
 
+    def debug(self, text: str):
+        ts = self._ts()
+        entry = f"[{ts}] {text}"
+        self._safe_dispatch("system_log", entry)
+
 
 # Initialize global UI Instance (Replacing ConsoleUI)
 UI = TUIAdapter()
