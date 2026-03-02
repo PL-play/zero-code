@@ -2,6 +2,7 @@ import queue
 import re
 import subprocess
 import threading
+import uuid
 from pathlib import Path
 
 from core.runtime import WORKDIR, safe_path
@@ -101,6 +102,65 @@ class BashSession:
 
 
 BASH = BashSession(WORKDIR)
+
+
+class BackgroundManager:
+    """Background command runner with task tracking."""
+
+    def __init__(self):
+        self.tasks = {}  # task_id -> {status, result, command}
+        self._lock = threading.Lock()
+
+    def run(self, command: str) -> str:
+        dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
+        if any(d in command for d in dangerous):
+            return "Error: Dangerous command blocked"
+
+        task_id = str(uuid.uuid4())[:8]
+        self.tasks[task_id] = {"status": "running", "result": None, "command": command}
+        thread = threading.Thread(target=self._execute, args=(task_id, command), daemon=True)
+        thread.start()
+        return f"Background task {task_id} started: {command[:80]}"
+
+    def _execute(self, task_id: str, command: str):
+        try:
+            r = subprocess.run(
+                command,
+                shell=True,
+                cwd=WORKDIR,
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+            output = (r.stdout + r.stderr).strip()[:50000]
+            status = "completed"
+        except subprocess.TimeoutExpired:
+            output = "Error: Timeout (300s)"
+            status = "timeout"
+        except Exception as e:
+            output = f"Error: {e}"
+            status = "error"
+
+        with self._lock:
+            task = self.tasks.get(task_id)
+            if task is not None:
+                task["status"] = status
+                task["result"] = output or "(no output)"
+
+    def check(self, task_id: str = None) -> str:
+        if task_id:
+            task = self.tasks.get(task_id)
+            if not task:
+                return f"Error: Unknown task {task_id}"
+            return f"[{task['status']}] {task['command'][:60]}\n{task.get('result') or '(running)'}"
+
+        lines = []
+        for tid, task in self.tasks.items():
+            lines.append(f"{tid}: [{task['status']}] {task['command'][:60]}")
+        return "\n".join(lines) if lines else "No background tasks."
+
+
+BG = BackgroundManager()
 
 
 def run_bash(command: str = None, restart: bool = False) -> str:
@@ -324,6 +384,14 @@ def run_grep(pattern: str, path: str = ".", include: str = None, max_results: in
         return f"Error: {e}"
 
 
+def run_background(command: str) -> str:
+    return BG.run(command)
+
+
+def check_background(task_id: str = None) -> str:
+    return BG.check(task_id)
+
+
 TOOL_HANDLERS = {
     "bash": lambda **kw: run_bash(kw.get("command"), kw.get("restart", False)),
     "read_file": lambda **kw: run_read(kw["path"], kw.get("offset"), kw.get("limit")),
@@ -335,6 +403,8 @@ TOOL_HANDLERS = {
     "grep": lambda **kw: run_grep(kw["pattern"], kw.get("path", "."), kw.get("include"), kw.get("max_results", 50)),
     "load_skill": lambda **kw: SKILL_LOADER.get_content(kw["name"]),
     "todo": lambda **kw: TODO.update(kw["items"]),
+    "background_run": lambda **kw: run_background(kw["command"]),
+    "check_background": lambda **kw: check_background(kw.get("task_id")),
 }
 
 BASE_TOOLS = [
@@ -463,6 +533,23 @@ PARENT_TOOLS = BASE_TOOLS + [
                 },
             },
             "required": ["items"],
+        },
+    },
+    {
+        "name": "background_run",
+        "description": "Run a shell command in your private background worker.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"command": {"type": "string"}},
+            "required": ["command"],
+        },
+    },
+    {
+        "name": "check_background",
+        "description": "Check your private background tasks; omit task_id to list all.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"task_id": {"type": "string"}},
         },
     },
 ]
