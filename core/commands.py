@@ -16,7 +16,7 @@ SLASH_COMMANDS = [
 
 
 def _handle_help(**_):
-    table = Table(show_header=True, border_style="blue", padding=(0, 1))
+    table = Table(show_header=True, border_style="blue", padding=(0, 1), expand=True)
     table.add_column("Command", style="bold cyan", no_wrap=True)
     table.add_column("Description")
     for cmd in SLASH_COMMANDS:
@@ -57,11 +57,11 @@ def _handle_skills(**_):
     if not SKILL_LOADER.skills:
         UI.console.print(f"[dim]{UI._ts()} No skills found in {SKILLS_DIR}/[/dim]")
         return
-    table = Table(show_header=True, border_style="magenta", padding=(0, 1))
-    table.add_column("Name", style="bold cyan")
+    table = Table(show_header=True, border_style="magenta", padding=(0, 1), expand=True)
+    table.add_column("Name", style="bold cyan", no_wrap=True)
     table.add_column("Description")
     table.add_column("Tags", style="dim")
-    table.add_column("Path", style="dim")
+    table.add_column("Path", style="dim", overflow="fold")
     for name, skill in SKILL_LOADER.skills.items():
         desc = skill["meta"].get("description", "-")
         tags = skill["meta"].get("tags", "-")

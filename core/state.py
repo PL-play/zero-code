@@ -19,186 +19,145 @@ from core.runtime import AGENT_DIR, MODEL, SKILLS_DIR, WORKDIR, client
 TOOL_MAX_LINES = 20
 
 
-class ConsoleUI:
-    """Rich terminal UI with replaceable tool area and persistent todo panel."""
+class TUIAdapter:
+    """Bridge between synchronous agent codebase and the Textual App events."""
 
     def __init__(self):
-        self.console = Console()
-        self._tool_area_height = 0
-        self._todo_area_height = 0
-        self._usage_area_height = 0
         self._current_todo = ""
-        self._tool_buffer: list[str] = []
+        self._tool_buffer = []
 
-    @staticmethod
-    def _ts() -> str:
+    def set_app(self, app):
+        """Link the Textual App instance so we can dispatch calls thread-safely."""
+        self.app = app
+
+    def _ts(self) -> str:
         return datetime.now().strftime("%H:%M:%S")
 
-    def _measure(self, renderable) -> int:
-        buf = StringIO()
-        Console(file=buf, width=self.console.width, no_color=True).print(renderable)
-        return buf.getvalue().count("\n")
+    def _safe_dispatch(self, method_name: str, *args, **kwargs):
+        """Call a method on the Textual app safely from the agent thread."""
+        if hasattr(self, "app"):
+            method = getattr(self.app, method_name, None)
+            if method:
+                import threading
+                import asyncio
+                
+                # If we are already in the main asyncio event loop (e.g. from slash commands directly),
+                # just call the method directly. Otherwise, use call_from_thread.
+                try:
+                    loop = asyncio.get_running_loop()
+                    is_async = True
+                except RuntimeError:
+                    is_async = False
+                    
+                if is_async and threading.current_thread() is threading.main_thread():
+                    method(*args, **kwargs)
+                else:
+                    self.app.call_from_thread(method, *args, **kwargs)
 
-    def _clear_up(self, n: int):
-        if n <= 0:
-            return
-        sys.stdout.write(f"\033[{n}A\033[J")
-        sys.stdout.flush()
-
-    def _clear_dynamic(self):
-        total = self._tool_area_height + self._todo_area_height + self._usage_area_height
-        self._clear_up(total)
-        self._tool_area_height = 0
-        self._todo_area_height = 0
-        self._usage_area_height = 0
-
-    def _render_tool_panel(self):
-        if not self._tool_buffer:
-            return
-        visible = self._tool_buffer[-TOOL_MAX_LINES:]
-        if len(self._tool_buffer) > TOOL_MAX_LINES:
-            hidden = len(self._tool_buffer) - TOOL_MAX_LINES
-            body_text = f"  ... {hidden} lines above ...\n" + "\n".join(visible)
-        else:
-            body_text = "\n".join(visible)
-
-        panel = Panel(
-            Text(body_text),
-            title=f"[bold cyan]Tools[/bold cyan] [dim]({len(self._tool_buffer)} entries)[/dim]",
-            subtitle=f"[dim]{self._ts()}[/dim]",
-            border_style="cyan",
-            padding=(0, 1),
-        )
-        self._tool_area_height = self._measure(panel)
-        self.console.print(panel)
-
-    def _render_todo(self):
-        if not self._current_todo or self._current_todo == "No todos.":
-            self._todo_area_height = 0
-            return
-        panel = Panel(
-            Text(self._current_todo),
-            title="[bold green]TODO[/bold green]",
-            subtitle=f"[dim]{self._ts()}[/dim]",
-            border_style="green",
-            padding=(0, 1),
-        )
-        self._todo_area_height = self._measure(panel)
-        self.console.print(panel)
-
-    def _render_usage(self):
-        """Render token usage panel from global CTX."""
-        try:
-            ctx = globals().get("CTX")
-            if ctx is None:
-                self._usage_area_height = 0
-                return
-            text = ctx.all_usage_summary()
-            panel = Panel(
-                Text(text),
-                title="[bold yellow]Token Usage[/bold yellow]",
-                subtitle=f"[dim]{self._ts()}[/dim]",
-                border_style="yellow",
-                padding=(0, 1),
-            )
-            self._usage_area_height = self._measure(panel)
-            self.console.print(panel)
-        except Exception:
-            self._usage_area_height = 0
-
-    def _refresh(self):
-        self._clear_dynamic()
-        self._render_tool_panel()
-        self._render_usage()
-        self._render_todo()
-
+    ##### Agent Lifecycle / Execution Logging #####
     def new_tool_cycle(self):
         self._tool_buffer = []
 
     def tool_call(self, name: str, output: str, is_sub: bool = False):
         ts = self._ts()
         prefix = "  sub" if is_sub else "    "
-        out_preview = output.replace("\n", " ")
+        out_preview = output.replace("\n", " ").strip()
         if len(out_preview) > 120:
             out_preview = out_preview[:117] + "..."
-        entry = f"{ts} {prefix} {name}: {out_preview}"
+        entry = f"[{ts}] {prefix} {name}: {out_preview}"
         self._tool_buffer.append(entry)
-        self._refresh()
+        
+        # Send a more detailed output to the TUI logs panel
+        output_str = str(output)
+        if len(output_str) > 2000:
+            output_str = output_str[:2000] + "\n... (truncated)"
+        detailed_entry = f"[{ts}] {prefix} {name}:\n{output_str}\n" + "-"*40
+
+        self._safe_dispatch("agent_log", detailed_entry)
+        self._safe_dispatch("set_status", f"Running: {name}...")
 
     def task_start(self, desc: str, prompt_preview: str):
         ts = self._ts()
         if len(prompt_preview) > 100:
             prompt_preview = prompt_preview[:97] + "..."
-        self._tool_buffer.append(f"{ts}      sub_agent ({desc}): {prompt_preview}")
-        self._refresh()
+        entry = f"[{ts}]      sub_agent ({desc}): {prompt_preview}"
+        self._tool_buffer.append(entry)
+        self._safe_dispatch("agent_log", entry)
+        self._safe_dispatch("set_status", f"Sub-agent: {desc}")
 
     def subagent_text(self, text: str):
         ts = self._ts()
-        preview = text.replace("\n", " ")
+        preview = text.replace("\n", " ").strip()
         if len(preview) > 120:
             preview = preview[:117] + "..."
-        self._tool_buffer.append(f"{ts}   sub> {preview}")
-        self._refresh()
+        entry = f"[{ts}]   sub> {preview}"
+        self._tool_buffer.append(entry)
+        self._safe_dispatch("agent_log", entry)
 
     def subagent_limit(self, max_rounds: int):
         ts = self._ts()
-        self._tool_buffer.append(f"{ts}   sub> [hit {max_rounds}-round limit, forcing summary]")
-        self._refresh()
+        entry = f"[{ts}]   sub> [hit {max_rounds}-round limit, forcing summary]"
+        self._tool_buffer.append(entry)
+        self._safe_dispatch("agent_log", entry)
 
+    ##### Status Info #####
     def update_todo(self, text: str):
-        self._clear_up(self._todo_area_height + self._usage_area_height)
-        self._todo_area_height = 0
-        self._usage_area_height = 0
         self._current_todo = text
-        self._render_usage()
-        self._render_todo()
+        self._safe_dispatch("update_todos", text)
+
+        # Also update usage while we're syncing state
+        try:
+            ctx = globals().get("CTX")
+            if ctx is not None:
+                self._safe_dispatch("update_usage", ctx.all_usage_summary())
+        except Exception:
+            pass
 
     def show_reply(self, text: str):
-        self._clear_dynamic()
-        self._tool_buffer = []
-        self._current_todo = ""
-        self.console.print()
-        panel = Panel(
-            text,
-            title=f"[bold blue]agent[/bold blue]",
-            subtitle=f"[dim]{self._ts()}[/dim]",
-            border_style="blue",
-            padding=(0, 1),
-        )
-        self.console.print(panel)
-        self.console.print()
-
-    def get_input(self) -> str:
-        return self.console.input(f"[dim]{self._ts()}[/dim] [bold green]you>[/bold green] ")
-
-    def welcome(self):
-        self.console.print()
-        table = Table(show_header=False, border_style="blue", padding=(0, 1))
-        table.add_column(style="bold")
-        table.add_column()
-        table.add_row("Workspace", str(WORKDIR))
-        table.add_row("Agent Home", str(AGENT_DIR))
-        table.add_row("Model", MODEL)
-        self.console.print(
-            Panel(
-                table,
-                title="[bold blue]ZERO-CODE[/bold blue] [red]by Ran[red]",
-                border_style="blue",
-                padding=(1, 2),
-            )
-        )
-        self.console.print()
-
-    def error(self, text: str):
-        self.console.print(f"[dim]{self._ts()}[/dim] [bold red]error:[/bold red] {text}")
+        # The main loop now grabs the final yield directly and appends it to chat,
+        # but if we wanted to push it here, we'd do:
+        # self._safe_dispatch("append_chat", text, "agent")
+        self._safe_dispatch("set_status", "Idle")
 
     def nag_reminder(self):
         ts = self._ts()
-        self._tool_buffer.append(f"{ts}      [reminder: update your todos]")
-        self._refresh()
+        entry = f"[{ts}]      [reminder: update your todos]"
+        self._tool_buffer.append(entry)
+        self._safe_dispatch("agent_log", entry)
+
+    ##### Stubs for legacy CLI UI code to avoid crashing agent.py #####
+    @property
+    def console(self):
+        class PseudoConsole:
+            def __init__(self, parent):
+                self.parent = parent
+            
+            def print(self, *args, **kwargs):
+                # When scripts use UI.console.print, we forward it to the rich log
+                # We mainly write the first argument if it's a rich object
+                if args:
+                    if len(args) == 1 and kwargs.get('end', '\n') == '\r':
+                        # Ignore those round 1/15 update loops that overwrite previous lines
+                        self.parent._safe_dispatch("set_status", str(args[0]))
+                    else:
+                        self.parent._safe_dispatch("agent_log", args[0])
+        return PseudoConsole(self)
+
+    def get_input(self) -> str:
+        # Not needed in TUI, should not be called
+        return ""
+
+    def welcome(self):
+        pass
+
+    def error(self, text: str):
+        ts = self._ts()
+        entry = f"[{ts}] error: {text}"
+        self._safe_dispatch("agent_log", f"[bold red]{entry}[/bold red]")
 
 
-UI = ConsoleUI()
+# Initialize global UI Instance (Replacing ConsoleUI)
+UI = TUIAdapter()
 
 
 class TodoManager:
