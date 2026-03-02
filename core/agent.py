@@ -36,6 +36,8 @@ Model: {MODEL}
 - load_skill: load specialized knowledge before tackling unfamiliar domains. Check available skills first.
 - sub_agent: delegate to a child agent with fresh context. Use mode="explore" for read-only investigation, mode="execute" for tasks that modify files.
 - todo: track multi-step tasks. Keep exactly one item in_progress at a time.
+- background_run: run a shell command asynchronously in a background worker.
+- check_background: inspect status/output of background tasks by task_id or list all.
 
 # Todo Discipline
 - Use the todo tool for any task with 3+ steps. This is mandatory, not optional.
