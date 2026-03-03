@@ -222,3 +222,6 @@ web/out/
 .vercel
 .env*.local
 test_providers.py
+
+# macOS
+.DS_Store
