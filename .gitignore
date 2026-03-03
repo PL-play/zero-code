@@ -225,3 +225,6 @@ test_providers.py
 
 # macOS
 .DS_Store
+
+# references
+references/
