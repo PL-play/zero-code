@@ -1,4 +1,4 @@
-from typing import TypedDict, Literal, Any, Dict, List, Optional, AsyncIterator, Protocol
+from typing import TypedDict, Literal, Any, Dict, List, Optional, AsyncIterator, Protocol, Callable
 
 from dataclasses import dataclass, field
 
@@ -361,8 +361,15 @@ class LLMService(Protocol):
     - Convenience wrappers (`predict`, `chat`, `predict_stream`) are thin sugar over the above.
     """
 
-    async def complete(self, request: "LLMRequest") -> LLMResponse:
-        """Preferred API (non-streaming)."""
+    async def complete(
+            self,
+            request: "LLMRequest",
+            *,
+            on_chunk_delta_text: Optional[Callable[[str], Any]] = None,
+            on_chunk_think: Optional[Callable[[str], Any]] = None,
+            on_stream_end: Optional[Callable[["LLMResponse"], Any]] = None,
+    ) -> LLMResponse:
+        """Preferred API (non-streaming). Can optional receive chunk hooks."""
         ...
 
     async def stream(self, request: "LLMRequest") -> AsyncIterator["LLMStreamChunk"]:

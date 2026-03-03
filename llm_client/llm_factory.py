@@ -8,14 +8,14 @@ model utilities, but adapted to zrag's `LLMService` Protocol.
 
 from __future__ import annotations
 
+import inspect
 import logging
 import asyncio
 import random
-from typing import cast, Protocol, TypedDict, Literal
-from dataclasses import dataclass, field
+from typing import cast, Callable
 from typing import Any, AsyncIterator, Dict, List, Optional, Sequence, Tuple
 
-from openai import AsyncOpenAI, AsyncStream
+from openai import AsyncOpenAI
 
 from .interface import LLMService, OpenAICompatibleChatConfig, LLMTokenUsage, LLMRequest, LLMResponse, \
     LLMStreamChunk
@@ -40,7 +40,6 @@ class OpenAICompatibleChatLLMService(LLMService):
 
     - Uses `openai.AsyncOpenAI`
     - Records token usage from response.usage (if present)
-    - Implements zrag's `LLMService` protocol and an optional `get_last_token_usage()`
     """
 
     def __init__(self, cfg: OpenAICompatibleChatConfig):
@@ -363,15 +362,19 @@ class OpenAICompatibleChatLLMService(LLMService):
     def _request_kwargs(self, request: LLMRequest) -> Dict[str, Any]:
         """
         Map `LLMRequest` into kwargs for OpenAI-compatible chat.completions.create.
+        Falls back to self._cfg for default settings.
         """
         out: Dict[str, Any] = dict(request.extra or {})
-        if request.model:
-            out["model"] = request.model
-        if request.temperature is not None:
-            out["temperature"] = float(request.temperature)
-        if request.max_tokens is not None:
+        out["model"] = request.model if request.model else self._cfg.model
+        
+        req_temp = request.temperature if request.temperature is not None else self._cfg.temperature
+        if req_temp is not None:
+            out["temperature"] = float(req_temp)
+
+        req_max_tokens = request.max_tokens if request.max_tokens is not None else self._cfg.max_tokens
+        if req_max_tokens is not None:
             try:
-                max_tokens = int(request.max_tokens)
+                max_tokens = int(req_max_tokens)
             except Exception:
                 max_tokens = None
             if max_tokens is not None and max_tokens > 0:
@@ -416,7 +419,14 @@ class OpenAICompatibleChatLLMService(LLMService):
             extra=dict(request.extra or {}),
         )
 
-    async def complete(self, request: LLMRequest) -> LLMResponse:
+    async def complete(
+        self,
+        request: LLMRequest,
+        *,
+        on_chunk_delta_text: Optional[Callable[[str], Any]] = None,
+        on_chunk_think: Optional[Callable[[str], Any]] = None,
+        on_stream_end: Optional[Callable[[LLMResponse], Any]] = None,
+    ) -> LLMResponse:
         """
         Canonical non-streaming API (preferred).
         """
@@ -431,8 +441,16 @@ class OpenAICompatibleChatLLMService(LLMService):
             chunks.append(chunk)
             if chunk.delta_text:
                 text_parts.append(chunk.delta_text)
+                if on_chunk_delta_text:
+                    res_val = on_chunk_delta_text(chunk.delta_text)
+                    if inspect.isawaitable(res_val):
+                        await res_val
             if chunk.think:
                 think_parts.append(chunk.think)
+                if on_chunk_think:
+                    res_val = on_chunk_think(chunk.think)
+                    if inspect.isawaitable(res_val):
+                        await res_val
             if chunk.tool_calls:
                 last_tool_calls = list(chunk.tool_calls)
             if chunk.token_usage is not None:
@@ -452,6 +470,12 @@ class OpenAICompatibleChatLLMService(LLMService):
         res.stream_chunks = chunks
         res.raw_completion = last_raw_event
         res.think = "".join(think_parts)
+
+        if on_stream_end:
+            res_val = on_stream_end(res)
+            if inspect.isawaitable(res_val):
+                await res_val
+
         return res
 
     async def stream(self, request: LLMRequest) -> AsyncIterator[LLMStreamChunk]:
@@ -643,11 +667,8 @@ class OpenAICompatibleChatLLMService(LLMService):
         while True:
             async def _open_stream() -> Any:
                 return await client.chat.completions.create(
-                    model=stream_kwargs.get("model") or self._cfg.model,
                     messages=current_request.to_messages(),
-                    temperature=stream_kwargs.get("temperature", self._cfg.temperature),
-                    max_tokens=stream_kwargs.get("max_tokens", self._cfg.max_tokens),
-                    **{k: v for k, v in stream_kwargs.items() if k not in {"model", "temperature", "max_tokens"}},
+                    **stream_kwargs
                 )
 
             stream: Any = await self._with_retries(

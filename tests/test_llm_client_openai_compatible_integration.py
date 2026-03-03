@@ -161,3 +161,58 @@ async def test_openai_compatible_client_real_complete(capsys):
         assert len(response.stream_chunks) > 0, "Expected stream_chunks to be aggregated in complete() response"
     finally:
         await client.close()
+
+
+@pytest.mark.integration
+@pytest.mark.anyio
+async def test_openai_compatible_client_real_complete_hooks(capsys):
+    cfg = _test_config()
+    if cfg is None:
+        pytest.skip(
+            "Missing OPENAI_COMPAT_MODEL / OPENAI_COMPAT_BASE_URL / OPENAI_COMPAT_API_KEY for real-call test."
+        )
+
+    client = OpenAICompatibleChatLLMService(cfg)
+    request = LLMRequest(
+        messages=[{"role": "user", "content": "写一首诗歌。表达爱情，13行左右"}],
+        system_prompt=SYSTEM_PROMPT,
+        tools=TOOLS,
+        tool_choice="auto",
+        max_tokens=256,
+        temperature=0.4,
+    )
+
+    think_chunks_captured = []
+    text_chunks_captured = []
+    end_hook_calls = []
+
+    def on_chunk_think(think_str: str):
+        if think_str:
+            think_chunks_captured.append(think_str)
+            with capsys.disabled():
+                # 蓝色打印 think 内容
+                print(f"\033[94m{think_str}\033[0m", end="", flush=True)
+
+    def on_chunk_delta_text(text_str: str):
+        if text_str:
+            text_chunks_captured.append(text_str)
+            with capsys.disabled():
+                print(text_str, end="", flush=True)
+
+    def on_stream_end(res):
+        end_hook_calls.append(res)
+        with capsys.disabled():
+            print(f"\n[STREAM_END_HOOK] tokens: {res.token_usage.total_tokens}")
+
+    try:
+        with capsys.disabled():
+            print("\n=== COMPLETE WITH HOOKS RUN ===")
+        response = await client.complete(
+            request,
+            on_chunk_think=on_chunk_think,
+            on_chunk_delta_text=on_chunk_delta_text,
+            on_stream_end=on_stream_end,
+        )
+
+    finally:
+        await client.close()
