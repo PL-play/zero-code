@@ -6,6 +6,8 @@ from textual.message import Message
 from textual import events, work
 from textual.screen import ModalScreen
 from pathlib import Path
+import asyncio
+import os
 import time
 import threading
 import subprocess
@@ -326,6 +328,33 @@ class ZeroCodeApp(App):
         color: #00FFCC;
     }
 
+    #transient_panels {
+        height: auto;
+        padding: 0 1 1 1;
+        background: #1A1A24;
+    }
+
+    #think_live {
+        display: none;
+        height: auto;
+        max-height: 6;
+        padding: 0 1;
+        margin-bottom: 1;
+        border: round #A855F7;
+        background: #141220;
+        color: #D8B4FE;
+    }
+
+    #tool_chain {
+        display: none;
+        height: auto;
+        max-height: 8;
+        padding: 0 1;
+        border: round #FACC15;
+        background: #1E1A10;
+        color: #FDE68A;
+    }
+
     #right_pane {
         width: 40%;
         height: 100%;
@@ -447,6 +476,7 @@ class ZeroCodeApp(App):
 
     BINDINGS = [
         Binding("ctrl+c", "quit", "Quit", show=True),
+        Binding("escape", "cancel_agent", "Stop Agent", show=True),
         Binding("ctrl+r", "refresh_explorer", "Refresh Explorer", show=True),
         Binding("f5", "refresh_explorer", "Refresh Explorer", show=False),
     ]
@@ -454,6 +484,55 @@ class ZeroCodeApp(App):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.history = []
+        self._stream_chunk_count = 0
+        self._stream_think_count = 0
+        self._stream_text_buffer = ""
+        self._stream_pending_buffer = ""
+        self._stream_wrapper: Container | None = None
+        self._stream_text_widget: Static | None = None
+        self._stream_last_flush_ts = 0.0
+        try:
+            self._stream_min_flush_interval_s = max(
+                0.01,
+                float(os.getenv("STREAM_FLUSH_MIN_INTERVAL_S", "0.08")),
+            )
+        except Exception:
+            self._stream_min_flush_interval_s = 0.08
+        try:
+            self._stream_min_flush_chars = max(
+                1,
+                int(os.getenv("STREAM_FLUSH_MIN_CHARS", "24")),
+            )
+        except Exception:
+            self._stream_min_flush_chars = 24
+        self._agent_running = False
+        self._agent_cancel_event: threading.Event | None = None
+        self._agent_task: asyncio.Task | None = None
+        self._status_text = "Idle"
+        self._spinner_idx = 0
+        self._spinner_frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+        self._think_live_buffer = ""
+        self._tool_chain_entries: list[str] = []
+        self._tool_chain_max_entries = 6
+        try:
+            self._think_hide_delay_s = max(0.0, float(os.getenv("THINK_PANEL_HIDE_DELAY_S", "1.8")))
+        except Exception:
+            self._think_hide_delay_s = 1.8
+        try:
+            self._tool_hide_delay_s = max(0.0, float(os.getenv("TOOL_PANEL_HIDE_DELAY_S", "2.2")))
+        except Exception:
+            self._tool_hide_delay_s = 2.2
+        self._tool_chain_title = os.getenv("TOOL_CHAIN_TITLE", "Tool Execution Chain")
+        self._think_hide_timer = None
+        self._tool_hide_timer = None
+
+    def _cancel_timer(self, timer_obj):
+        if timer_obj is None:
+            return
+        try:
+            timer_obj.stop()
+        except Exception:
+            pass
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -461,6 +540,9 @@ class ZeroCodeApp(App):
             # Left Pane: Chat
             with Vertical(id="left_pane"):
                 yield VerticalScroll(id="chat_history")
+                with Vertical(id="transient_panels"):
+                    yield Static("", id="think_live")
+                    yield Static("", id="tool_chain")
                 yield ChatInput(id="chat_input")
 
             # Right Pane: Tools/Tabs
@@ -484,6 +566,7 @@ class ZeroCodeApp(App):
             Label(f" 📂 {WORKDIR} ", classes="status-dim"),
             Label(" ZeroCode Zen ", classes="status-dim"),
             Static("", id="status_spacer"),
+            Label("Idle", id="run_status", classes="status-dim"),
             Label("tab agents  ctrl+p commands", classes="status-dim"),
             Label(" ○ ZeroCode 1.0 ", classes="status-highlight"),
             id="status_bar"
@@ -512,7 +595,58 @@ Type your request below to get started. Use `/help` for commands.
         
         # Log welcome message to the agent logs as well
         self.agent_log(f"Initialized agent at {WORKDIR}")
+        self.set_interval(0.12, self._tick_run_status)
+        self._set_think_visible(False)
+        self._set_tool_chain_visible(False)
         self.query_one(ChatInput).focus()
+
+    def _set_think_visible(self, visible: bool):
+        try:
+            widget = self.query_one("#think_live", Static)
+            widget.styles.display = "block" if visible else "none"
+        except Exception:
+            pass
+
+    def _set_tool_chain_visible(self, visible: bool):
+        try:
+            widget = self.query_one("#tool_chain", Static)
+            widget.styles.display = "block" if visible else "none"
+        except Exception:
+            pass
+
+    def _render_tool_chain(self):
+        try:
+            widget = self.query_one("#tool_chain", Static)
+        except Exception:
+            return
+
+        if not self._tool_chain_entries:
+            widget.update("")
+            self._set_tool_chain_visible(False)
+            return
+
+        lines = [self._tool_chain_title]
+        for idx, entry in enumerate(self._tool_chain_entries):
+            if idx > 0:
+                lines.append("│")
+            branch = "└─" if idx == len(self._tool_chain_entries) - 1 else "├─"
+            lines.append(f"{branch} {entry}")
+
+        widget.update("\n".join(lines))
+        self._set_tool_chain_visible(True)
+
+    def _tick_run_status(self):
+        try:
+            label = self.query_one("#run_status", Label)
+        except Exception:
+            return
+
+        if self._agent_running:
+            self._spinner_idx = (self._spinner_idx + 1) % len(self._spinner_frames)
+            frame = self._spinner_frames[self._spinner_idx]
+            label.update(f"{frame} {self._status_text}")
+        else:
+            label.update(self._status_text or "Idle")
 
     async def action_refresh_explorer(self) -> None:
         try:
@@ -536,6 +670,21 @@ Type your request below to get started. Use `/help` for commands.
                 wrapper.styles.border_left = ("solid", "green")
                 wrapper.styles.padding = (0, 1)
                 wrapper.styles.margin = (1, 0)
+            elif role == "agent_plain":
+                wrapper = Container(Static(markdown_text), classes="chat-agent")
+                wrapper.styles.border_left = ("solid", "blue")
+                wrapper.styles.padding = (0, 1)
+                wrapper.styles.margin = (1, 0)
+            elif role == "think":
+                wrapper = Container(Markdown(f"**think [{now}]>**\n{markdown_text}"), classes="chat-agent")
+                wrapper.styles.border_left = ("solid", "magenta")
+                wrapper.styles.padding = (0, 1)
+                wrapper.styles.margin = (1, 0)
+            elif role == "tool":
+                wrapper = Container(Markdown(f"**tool [{now}]>**\n{markdown_text}"), classes="chat-agent")
+                wrapper.styles.border_left = ("solid", "yellow")
+                wrapper.styles.padding = (0, 1)
+                wrapper.styles.margin = (1, 0)
             else:
                 wrapper = Container(Markdown(f"**agent [{now}]>**\n{markdown_text}{dur_str}"), classes="chat-agent")
                 wrapper.styles.border_left = ("solid", "blue")
@@ -549,6 +698,18 @@ Type your request below to get started. Use `/help` for commands.
             _add_chat()
         else:
             self.call_from_thread(_add_chat)
+
+    def _ensure_stream_output_block(self):
+        if self._stream_text_widget is not None and self._stream_wrapper is not None:
+            return
+        chat = self.query_one("#chat_history", VerticalScroll)
+        self._stream_text_widget = Static("")
+        self._stream_wrapper = Container(self._stream_text_widget, classes="chat-agent")
+        self._stream_wrapper.styles.border_left = ("solid", "blue")
+        self._stream_wrapper.styles.padding = (0, 1)
+        self._stream_wrapper.styles.margin = (1, 0)
+        chat.mount(self._stream_wrapper)
+        chat.scroll_end(animate=False)
 
     def agent_log(self, text: str):
         """Append to the execution log in the right pane."""
@@ -580,7 +741,122 @@ Type your request below to get started. Use `/help` for commands.
             self.call_from_thread(_log)
 
     def set_status(self, text: str):
-        pass
+        self._status_text = text
+
+    async def action_cancel_agent(self) -> None:
+        if not self._agent_running or self._agent_cancel_event is None:
+            return
+        self._agent_cancel_event.set()
+        self.set_status("Stopping...")
+        self.system_log("Cancellation requested by ESC")
+        self.append_chat("Stopping current agent task...", "system")
+
+    def stream_start(self):
+        self._cancel_timer(self._think_hide_timer)
+        self._think_hide_timer = None
+        self._stream_chunk_count = 0
+        self._stream_think_count = 0
+        self._think_live_buffer = ""
+        self._stream_text_buffer = ""
+        self._stream_pending_buffer = ""
+        self._stream_wrapper = None
+        self._stream_text_widget = None
+        self._stream_last_flush_ts = time.monotonic()
+        try:
+            self.query_one("#think_live", Static).update("")
+        except Exception:
+            pass
+        self._set_think_visible(False)
+
+    def _flush_stream_pending(self):
+        if not self._stream_pending_buffer:
+            return
+        self._stream_text_buffer += self._stream_pending_buffer
+        self._stream_pending_buffer = ""
+        self._ensure_stream_output_block()
+        try:
+            if self._stream_text_widget is not None:
+                self._stream_text_widget.update(self._stream_text_buffer)
+            chat = self.query_one("#chat_history", VerticalScroll)
+            chat.scroll_end(animate=False)
+        except Exception:
+            pass
+        self._stream_last_flush_ts = time.monotonic()
+
+    def append_stream_text(self, text: str):
+        if not text or not text.strip():
+            return
+        self._stream_chunk_count += 1
+        self._stream_pending_buffer += text
+
+        now = time.monotonic()
+        should_flush = (
+            "\n" in text
+            or len(self._stream_pending_buffer) >= self._stream_min_flush_chars
+            or (now - self._stream_last_flush_ts) >= self._stream_min_flush_interval_s
+        )
+        if should_flush:
+            self._flush_stream_pending()
+
+    def append_stream_think(self, think: str):
+        self._cancel_timer(self._think_hide_timer)
+        self._think_hide_timer = None
+        self._stream_think_count += 1
+        self._think_live_buffer += think
+        try:
+            widget = self.query_one("#think_live", Static)
+            widget.update(f"思考中…\n{self._think_live_buffer.strip()}")
+        except Exception:
+            pass
+        self._set_think_visible(bool(self._think_live_buffer.strip()))
+
+    def append_tool_brief(self, brief: str):
+        self._cancel_timer(self._tool_hide_timer)
+        self._tool_hide_timer = None
+        self._tool_chain_entries.append(brief)
+        if len(self._tool_chain_entries) > self._tool_chain_max_entries:
+            self._tool_chain_entries = self._tool_chain_entries[-self._tool_chain_max_entries :]
+        self._render_tool_chain()
+
+    def stream_end(self):
+        self._flush_stream_pending()
+        if self._think_live_buffer.strip():
+            self._cancel_timer(self._think_hide_timer)
+
+            def _hide_think():
+                self._think_live_buffer = ""
+                try:
+                    self.query_one("#think_live", Static).update("")
+                except Exception:
+                    pass
+                self._set_think_visible(False)
+
+            self._think_hide_timer = self.set_timer(self._think_hide_delay_s, _hide_think)
+        else:
+            self._set_think_visible(False)
+        self._stream_wrapper = None
+        self._stream_text_widget = None
+        self._stream_text_buffer = ""
+        self._stream_pending_buffer = ""
+
+    def set_round_tools_present(self, has_tools: bool):
+        if has_tools:
+            return
+        if not self._tool_chain_entries:
+            self._set_tool_chain_visible(False)
+            return
+
+        self._cancel_timer(self._tool_hide_timer)
+
+        def _hide_tool_chain():
+            self._tool_chain_entries = []
+            try:
+                self.query_one("#tool_chain", Static).update("")
+            except Exception:
+                pass
+            self._set_tool_chain_visible(False)
+
+        self._tool_hide_timer = self.set_timer(self._tool_hide_delay_s, _hide_tool_chain)
 
     def update_todos(self, todo_text: str):
         def _update():
@@ -617,6 +893,10 @@ Type your request below to get started. Use `/help` for commands.
         if not query:
             return
 
+        if self._agent_running:
+            self.append_chat("Agent is running. Press ESC to stop current task.", "system")
+            return
+
         input_widget = self.query_one(ChatInput)
         input_widget.text = ""
 
@@ -635,10 +915,11 @@ Type your request below to get started. Use `/help` for commands.
 
         # Disable input while processing
         input_widget.disabled = True
+        self._agent_running = True
+        self._agent_cancel_event = threading.Event()
+        self.set_status("Running")
         
-        # Note: the worker dispatch will be added in step 2
-        # For now, we mock it
-        self.run_worker(self.process_agent_query(query), thread=True)
+        self._agent_task = asyncio.create_task(self.process_agent_query(query))
 
     def _handle_command(self, query: str):
         from core.commands import COMMAND_DISPATCH, SLASH_COMMANDS
@@ -662,15 +943,22 @@ Type your request below to get started. Use `/help` for commands.
         start_time = time.time()
         self.system_log(f"Starting agent query: {query}")
         try:
-            # We must run agent_loop... but it's synchronous and expects global UI
-            reply = agent_loop(self.history)
+            cancel_event = self._agent_cancel_event or threading.Event()
+            reply = await asyncio.to_thread(agent_loop, self.history, cancel_event)
             elapsed = time.time() - start_time
             self.system_log(f"Agent reply received, took {elapsed:.2f}s")
-            self.append_chat(reply, "agent", elapsed)
+            if reply == "[cancelled by user]":
+                self.append_chat("Agent task cancelled.", "system")
+            elif self._stream_chunk_count == 0:
+                self.append_chat(reply, "agent_plain", elapsed)
         except Exception as e:
             self.system_log(f"Agent error: {str(e)}")
             self.append_chat(f"**Error:** {str(e)}", "system")
         finally:
+            self._agent_running = False
+            self._agent_cancel_event = None
+            self._agent_task = None
+            self.set_status("Idle")
             self._enable_input_from_thread()
 
     def _enable_input_from_thread(self):

@@ -35,7 +35,7 @@ TOOLS = [
 
 
 def _test_config() -> OpenAICompatibleChatConfig | None:
-    model = os.getenv("MODEL_ID")
+    model = os.getenv("OPENAI_COMPAT_MODEL")
     base_url = os.getenv("OPENAI_COMPAT_BASE_URL")
     api_key = os.getenv("OPENAI_COMPAT_API_KEY")
 
