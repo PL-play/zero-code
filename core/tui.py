@@ -8,6 +8,7 @@ from textual.screen import ModalScreen
 from pathlib import Path
 import asyncio
 import os
+import re
 import time
 import threading
 import subprocess
@@ -421,6 +422,16 @@ class ZeroCodeApp(App):
         color: #555566;
     }
 
+    .status-running {
+        color: #FFD700;
+        text-style: bold;
+    }
+
+    .agent-meta {
+        color: #4a4a60;
+        margin: 0 0 1 2;
+    }
+
     #status_bar Label {
         margin-right: 2;
     }
@@ -479,6 +490,7 @@ class ZeroCodeApp(App):
         Binding("escape", "cancel_agent", "Stop Agent", show=True),
         Binding("ctrl+r", "refresh_explorer", "Refresh Explorer", show=True),
         Binding("f5", "refresh_explorer", "Refresh Explorer", show=False),
+        Binding("ctrl+y", "copy_last_reply", "Copy Reply", show=True),
     ]
 
     def __init__(self, *args, **kwargs):
@@ -490,6 +502,7 @@ class ZeroCodeApp(App):
         self._stream_pending_buffer = ""
         self._stream_wrapper: Container | None = None
         self._stream_text_widget: Static | None = None
+        self._stream_turn_started_at = 0.0
         self._stream_last_flush_ts = 0.0
         try:
             self._stream_min_flush_interval_s = max(
@@ -525,6 +538,8 @@ class ZeroCodeApp(App):
         self._tool_chain_title = os.getenv("TOOL_CHAIN_TITLE", "Tool Execution Chain")
         self._think_hide_timer = None
         self._tool_hide_timer = None
+        self._chat_input_placeholder = os.getenv("CHAT_INPUT_PLACEHOLDER", "请输入内容后按回车发送 (Shift+Enter 换行)")
+        self._last_reply_text: str = ""
 
     def _cancel_timer(self, timer_obj):
         if timer_obj is None:
@@ -561,12 +576,11 @@ class ZeroCodeApp(App):
                         yield RichLog(id="debug_logs", wrap=True, highlight=True, markup=True, auto_scroll=True)
         
         yield Horizontal(
-            Label(" Build ", classes="status-highlight"),
+            Label("Idle", id="run_status", classes="status-dim"),
             Label(f" {MODEL} "),
             Label(f" 📂 {WORKDIR} ", classes="status-dim"),
             Label(" ZeroCode Zen ", classes="status-dim"),
             Static("", id="status_spacer"),
-            Label("Idle", id="run_status", classes="status-dim"),
             Label("tab agents  ctrl+p commands", classes="status-dim"),
             Label(" ○ ZeroCode 1.0 ", classes="status-highlight"),
             id="status_bar"
@@ -598,7 +612,15 @@ Type your request below to get started. Use `/help` for commands.
         self.set_interval(0.12, self._tick_run_status)
         self._set_think_visible(False)
         self._set_tool_chain_visible(False)
-        self.query_one(ChatInput).focus()
+        input_widget = self.query_one(ChatInput)
+        input_widget.placeholder = self._chat_input_placeholder
+        input_widget.focus()
+
+    def _agent_meta_line(self, duration: float | None = None) -> str:
+        now = datetime.now().strftime("%H:%M:%S")
+        if duration is not None:
+            return f"{now}  {MODEL}  {duration:.1f}s"
+        return f"{now}  {MODEL}"
 
     def _set_think_visible(self, visible: bool):
         try:
@@ -644,8 +666,10 @@ Type your request below to get started. Use `/help` for commands.
         if self._agent_running:
             self._spinner_idx = (self._spinner_idx + 1) % len(self._spinner_frames)
             frame = self._spinner_frames[self._spinner_idx]
+            label.set_classes("status-running")
             label.update(f"{frame} {self._status_text}")
         else:
+            label.set_classes("status-dim")
             label.update(self._status_text or "Idle")
 
     async def action_refresh_explorer(self) -> None:
@@ -671,7 +695,10 @@ Type your request below to get started. Use `/help` for commands.
                 wrapper.styles.padding = (0, 1)
                 wrapper.styles.margin = (1, 0)
             elif role == "agent_plain":
-                wrapper = Container(Static(markdown_text), classes="chat-agent")
+                text = (markdown_text or "").rstrip()
+                self._last_reply_text = text
+                meta = self._agent_meta_line(duration) if duration is not None else self._agent_meta_line()
+                wrapper = Container(Static(text), Static(meta, classes="agent-meta"), classes="chat-agent")
                 wrapper.styles.border_left = ("solid", "blue")
                 wrapper.styles.padding = (0, 1)
                 wrapper.styles.margin = (1, 0)
@@ -751,11 +778,23 @@ Type your request below to get started. Use `/help` for commands.
         self.system_log("Cancellation requested by ESC")
         self.append_chat("Stopping current agent task...", "system")
 
+    async def action_copy_last_reply(self) -> None:
+        text = self._last_reply_text
+        if not text:
+            self.notify("No reply to copy", severity="warning", timeout=2)
+            return
+        try:
+            subprocess.run(["pbcopy"], input=text.encode(), check=True, timeout=3)
+            self.notify("Copied to clipboard ✓", timeout=2)
+        except Exception as e:
+            self.notify(f"Copy failed: {e}", severity="error", timeout=3)
+
     def stream_start(self):
         self._cancel_timer(self._think_hide_timer)
         self._think_hide_timer = None
         self._stream_chunk_count = 0
         self._stream_think_count = 0
+        self._stream_turn_started_at = time.monotonic()
         self._think_live_buffer = ""
         self._stream_text_buffer = ""
         self._stream_pending_buffer = ""
@@ -786,12 +825,20 @@ Type your request below to get started. Use `/help` for commands.
     def append_stream_text(self, text: str):
         if not text or not text.strip():
             return
+        normalized = text.replace("\r", "")
+        if not self._stream_text_buffer and not self._stream_pending_buffer:
+            normalized = normalized.lstrip("\n")
+        normalized = re.sub(r"\n[ \t]+\n", "\n\n", normalized)
+        normalized = re.sub(r"\n{3,}", "\n\n", normalized)
+        if not normalized.strip():
+            return
+
         self._stream_chunk_count += 1
-        self._stream_pending_buffer += text
+        self._stream_pending_buffer += normalized
 
         now = time.monotonic()
         should_flush = (
-            "\n" in text
+            "\n" in normalized
             or len(self._stream_pending_buffer) >= self._stream_min_flush_chars
             or (now - self._stream_last_flush_ts) >= self._stream_min_flush_interval_s
         )
@@ -805,7 +852,7 @@ Type your request below to get started. Use `/help` for commands.
         self._think_live_buffer += think
         try:
             widget = self.query_one("#think_live", Static)
-            widget.update(f"思考中…\n{self._think_live_buffer.strip()}")
+            widget.update(f"thinking…\n{self._think_live_buffer.strip()}")
         except Exception:
             pass
         self._set_think_visible(bool(self._think_live_buffer.strip()))
@@ -820,6 +867,8 @@ Type your request below to get started. Use `/help` for commands.
 
     def stream_end(self):
         self._flush_stream_pending()
+        if self._stream_text_buffer.strip():
+            self._last_reply_text = self._stream_text_buffer.rstrip()
         if self._think_live_buffer.strip():
             self._cancel_timer(self._think_hide_timer)
 
@@ -839,6 +888,21 @@ Type your request below to get started. Use `/help` for commands.
         self._stream_text_buffer = ""
         self._stream_pending_buffer = ""
 
+    def _finalize_stream_meta(self, elapsed: float):
+        """Mount a meta footer below the last agent reply in the chat."""
+        meta_text = self._agent_meta_line(elapsed)
+
+        def _mount():
+            try:
+                chat = self.query_one("#chat_history", VerticalScroll)
+                meta = Static(meta_text, classes="agent-meta")
+                chat.mount(meta)
+                chat.scroll_end(animate=False)
+            except Exception:
+                pass
+
+        self.call_later(_mount)
+
     def set_round_tools_present(self, has_tools: bool):
         if has_tools:
             return
@@ -857,6 +921,93 @@ Type your request below to get started. Use `/help` for commands.
             self._set_tool_chain_visible(False)
 
         self._tool_hide_timer = self.set_timer(self._tool_hide_delay_s, _hide_tool_chain)
+
+    def _cleanup_after_cancel(self):
+        """Clean up UI panels and message history after ESC cancellation."""
+        # --- hide transient panels immediately ---
+        self._cancel_timer(self._think_hide_timer)
+        self._think_hide_timer = None
+        self._think_live_buffer = ""
+        try:
+            self.query_one("#think_live", Static).update("")
+        except Exception:
+            pass
+        self._set_think_visible(False)
+
+        self._cancel_timer(self._tool_hide_timer)
+        self._tool_hide_timer = None
+        self._tool_chain_entries = []
+        try:
+            self.query_one("#tool_chain", Static).update("")
+        except Exception:
+            pass
+        self._set_tool_chain_visible(False)
+
+        # reset stream state
+        self._stream_wrapper = None
+        self._stream_text_widget = None
+        self._stream_text_buffer = ""
+        self._stream_pending_buffer = ""
+
+        # --- sanitize message history ---
+        self._sanitize_history_after_cancel()
+
+    def _sanitize_history_after_cancel(self):
+        """Ensure messages don't have orphan tool_calls without matching tool results.
+
+        After cancellation the assistant message with tool_calls is already in
+        self.history, but some (or all) of the corresponding role='tool'
+        responses may be missing.  The API requires every tool_call to have a
+        matching tool result.  We fill in stubs for missing ones so the next
+        request won't fail with error 2013.
+        """
+        msgs = self.history
+        if not msgs:
+            return
+
+        # Walk backwards to find the last assistant message with tool_calls
+        last_asst_idx = None
+        for i in range(len(msgs) - 1, -1, -1):
+            if msgs[i].get("role") == "assistant" and msgs[i].get("tool_calls"):
+                last_asst_idx = i
+                break
+
+        if last_asst_idx is None:
+            return  # nothing to fix
+
+        tool_calls = msgs[last_asst_idx]["tool_calls"]
+        expected_ids = set()
+        call_by_id: dict[str, dict] = {}
+        for tc in tool_calls:
+            tc_id = str(tc.get("id") or "")
+            expected_ids.add(tc_id)
+            call_by_id[tc_id] = tc
+
+        # Collect tool result ids that already follow the assistant msg
+        present_ids: set[str] = set()
+        for msg in msgs[last_asst_idx + 1 :]:
+            if msg.get("role") == "tool":
+                present_ids.add(str(msg.get("tool_call_id") or ""))
+            else:
+                break  # stop at first non-tool message
+
+        missing_ids = expected_ids - present_ids
+        if not missing_ids:
+            return  # all tool results present — nothing to fix
+
+        # Append stub results for each missing tool_call
+        for tc_id in missing_ids:
+            tc = call_by_id.get(tc_id, {})
+            fn = tc.get("function") if isinstance(tc, dict) else None
+            name = (fn.get("name") if isinstance(fn, dict) else None) or "unknown"
+            msgs.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tc_id,
+                    "name": name,
+                    "content": "[cancelled by user]",
+                }
+            )
 
     def update_todos(self, todo_text: str):
         def _update():
@@ -948,9 +1099,12 @@ Type your request below to get started. Use `/help` for commands.
             elapsed = time.time() - start_time
             self.system_log(f"Agent reply received, took {elapsed:.2f}s")
             if reply == "[cancelled by user]":
+                self._cleanup_after_cancel()
                 self.append_chat("Agent task cancelled.", "system")
             elif self._stream_chunk_count == 0:
                 self.append_chat(reply, "agent_plain", elapsed)
+            else:
+                self._finalize_stream_meta(elapsed)
         except Exception as e:
             self.system_log(f"Agent error: {str(e)}")
             self.append_chat(f"**Error:** {str(e)}", "system")
