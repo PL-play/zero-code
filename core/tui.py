@@ -477,6 +477,26 @@ class ZeroCodeApp(App):
         width: 100%;
     }
     
+    #file_changes {
+        height: auto;
+        padding: 1;
+        margin-bottom: 1;
+        border: solid #FACC15;
+        border-title-color: #FACC15;
+        background: #1A1A24;
+    }
+
+    .diff-block {
+        border-left: solid #FACC15;
+        padding: 0 1;
+        margin: 1 0;
+        height: auto;
+    }
+
+    .diff-block Static {
+        height: auto;
+    }
+
     #debug_logs {
         height: 1fr;
         color: #55AAFF;
@@ -571,6 +591,7 @@ class ZeroCodeApp(App):
                     with TabPane("Status", id="tab-status"):
                         with VerticalScroll():
                             yield Static("TODO", id="todo_list")
+                            yield Static("Files Changed:\n  (none)", id="file_changes")
                             yield Static("Token Usage:\nNo usage yet.", id="token_usage")
                     with TabPane("Debug", id="tab-debug"):
                         yield RichLog(id="debug_logs", wrap=True, highlight=True, markup=True, auto_scroll=True)
@@ -578,8 +599,8 @@ class ZeroCodeApp(App):
         yield Horizontal(
             Label("Idle", id="run_status", classes="status-dim"),
             Label(f" {MODEL} "),
-            Label(f" 📂 {WORKDIR} ", classes="status-dim"),
-            Label(" ZeroCode Zen ", classes="status-dim"),
+            Label("", id="git_branch", classes="status-highlight"),
+            Label(f" {WORKDIR.name} ", classes="status-dim"),
             Static("", id="status_spacer"),
             Label("tab agents  ctrl+p commands", classes="status-dim"),
             Label(" ○ ZeroCode 1.0 ", classes="status-highlight"),
@@ -607,9 +628,10 @@ Type your request below to get started. Use `/help` for commands.
         self.system_log(f"Model: {MODEL}")
         self.system_log(f"Workdir: {WORKDIR}")
         
-        # Log welcome message to the agent logs as well
         self.agent_log(f"Initialized agent at {WORKDIR}")
         self.set_interval(0.12, self._tick_run_status)
+        self.set_interval(10, self._periodic_git_refresh)
+        self._refresh_git_info()
         self._set_think_visible(False)
         self._set_tool_chain_visible(False)
         input_widget = self.query_one(ChatInput)
@@ -672,6 +694,46 @@ Type your request below to get started. Use `/help` for commands.
             label.set_classes("status-dim")
             label.update(self._status_text or "Idle")
 
+    def _refresh_git_info(self):
+        try:
+            branch_result = subprocess.run(
+                ["git", "-C", str(WORKDIR), "branch", "--show-current"],
+                capture_output=True, text=True, timeout=3,
+            )
+            branch = branch_result.stdout.strip() if branch_result.returncode == 0 else ""
+
+            dirty_count = 0
+            if branch:
+                status_result = subprocess.run(
+                    ["git", "-C", str(WORKDIR), "status", "--porcelain"],
+                    capture_output=True, text=True, timeout=3,
+                )
+                if status_result.returncode == 0:
+                    dirty_count = len([l for l in status_result.stdout.splitlines() if l.strip()])
+
+            if branch:
+                label_text = f" {branch}"
+                if dirty_count > 0:
+                    label_text += f" *{dirty_count}"
+                label_text += " "
+            else:
+                label_text = ""
+
+            try:
+                git_label = self.query_one("#git_branch", Label)
+                git_label.update(label_text)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def refresh_git_info(self):
+        """Public method callable from state.py via _safe_dispatch."""
+        self._refresh_git_info()
+
+    def _periodic_git_refresh(self):
+        self._refresh_git_info()
+
     async def action_refresh_explorer(self) -> None:
         try:
             tree = self.query_one("#explorer_tree", DirectoryTree)
@@ -725,6 +787,28 @@ Type your request below to get started. Use `/help` for commands.
             _add_chat()
         else:
             self.call_from_thread(_add_chat)
+
+    def append_diff(self, path: str, summary: str, diff_body: str):
+        """Append a colored diff block to the main chat timeline."""
+        def _add_diff():
+            chat = self.query_one("#chat_history", VerticalScroll)
+            now = datetime.now().strftime("%H:%M:%S")
+
+            title_widget = Static(f"[bold yellow]{summary}[/bold yellow]  [dim]{now}[/dim]", markup=True)
+
+            if diff_body.strip():
+                diff_widget = Static(Syntax(diff_body, "diff", theme="monokai", word_wrap=False))
+            else:
+                diff_widget = Static("[dim](no diff)[/dim]", markup=True)
+
+            wrapper = Container(title_widget, diff_widget, classes="diff-block")
+            chat.mount(wrapper)
+            chat.scroll_end(animate=False)
+
+        if self._thread_id == threading.get_ident():
+            _add_diff()
+        else:
+            self.call_from_thread(_add_diff)
 
     def _ensure_stream_output_block(self):
         if self._stream_text_widget is not None and self._stream_wrapper is not None:
@@ -1016,6 +1100,18 @@ Type your request below to get started. Use `/help` for commands.
             except Exception:
                 pass
                 
+        if self._thread_id == threading.get_ident():
+            _update()
+        else:
+            self.call_from_thread(_update)
+
+    def update_file_changes(self, text: str):
+        def _update():
+            try:
+                self.query_one("#file_changes", Static).update(text)
+            except Exception:
+                pass
+
         if self._thread_id == threading.get_ident():
             _update()
         else:

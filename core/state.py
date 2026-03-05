@@ -26,6 +26,7 @@ class TUIAdapter:
     def __init__(self):
         self._current_todo = ""
         self._tool_buffer = []
+        self._file_stats: dict[str, dict] = {}
 
     def set_app(self, app):
         """Link the Textual App instance so we can dispatch calls thread-safely."""
@@ -101,7 +102,14 @@ class TUIAdapter:
             return f"bash: {command}" if command else "bash"
         if name == "edit_file":
             path = _rel_path(str(tool_input.get("path") or ""))
-            return f"edit_file: {path}"
+            replace_all = tool_input.get("replace_all", False)
+            suffix = " (replace_all)" if replace_all else ""
+            return f"edit_file: {path}{suffix}"
+        if name == "apply_patch":
+            path = _rel_path(str(tool_input.get("path") or ""))
+            patch = str(tool_input.get("patch") or "")
+            hunk_count = patch.count("@@")
+            return f"apply_patch: {path} ({hunk_count} context markers)"
         if name == "write_file":
             path = _rel_path(str(tool_input.get("path") or ""))
             return f"write_file: {path}"
@@ -130,6 +138,68 @@ class TUIAdapter:
             brief = self._tool_brief(name, tool_input, output)
             self._safe_dispatch("append_tool_brief", brief)
         self._safe_dispatch("set_status", f"Running: {name}...")
+
+        if name in ("edit_file", "apply_patch") and not output.startswith("Error"):
+            parts = output.split("\n", 1)
+            summary = parts[0]
+            diff_body = parts[1] if len(parts) > 1 else ""
+            self._safe_dispatch("append_diff", summary, summary, diff_body)
+            self._track_file_edit(tool_input, diff_body)
+
+    def _track_file_edit(self, tool_input: dict | None, diff_body: str):
+        tool_input = tool_input or {}
+        raw_path = str(tool_input.get("path") or "")
+        if not raw_path:
+            return
+        try:
+            p = Path(raw_path)
+            resolved = p.resolve() if p.is_absolute() else (WORKDIR / p).resolve()
+            rel = str(resolved.relative_to(WORKDIR))
+        except Exception:
+            rel = raw_path
+
+        added = 0
+        deleted = 0
+        for line in diff_body.split("\n"):
+            if line.startswith("+") and not line.startswith("+++"):
+                added += 1
+            elif line.startswith("-") and not line.startswith("---"):
+                deleted += 1
+
+        if rel not in self._file_stats:
+            self._file_stats[rel] = {"added": 0, "deleted": 0, "edits": 0}
+        self._file_stats[rel]["added"] += added
+        self._file_stats[rel]["deleted"] += deleted
+        self._file_stats[rel]["edits"] += 1
+
+        self._safe_dispatch("update_file_changes", self._render_file_stats())
+        self._safe_dispatch("refresh_git_info")
+
+    def _get_git_file_status(self, rel_path: str) -> str:
+        try:
+            import subprocess
+            r = subprocess.run(
+                ["git", "-C", str(WORKDIR), "status", "--porcelain", "--", rel_path],
+                capture_output=True, text=True, timeout=3,
+            )
+            if r.returncode == 0 and r.stdout.strip():
+                return r.stdout.strip()[:2].strip() or "M"
+            return " "
+        except Exception:
+            return "?"
+
+    def _render_file_stats(self) -> str:
+        if not self._file_stats:
+            return "Files Changed:\n  (none)"
+        lines = ["Files Changed:"]
+        for path, stats in sorted(self._file_stats.items()):
+            git_st = self._get_git_file_status(path)
+            added = stats["added"]
+            deleted = stats["deleted"]
+            edits = stats["edits"]
+            edit_word = "edit" if edits == 1 else "edits"
+            lines.append(f"  {git_st} {path}  +{added} -{deleted} ({edits} {edit_word})")
+        return "\n".join(lines)
 
     def task_start(self, desc: str, prompt_preview: str):
         ts = self._ts()
