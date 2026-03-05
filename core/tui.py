@@ -14,7 +14,57 @@ import threading
 import subprocess
 from datetime import datetime
 from rich.syntax import Syntax
+from rich.markdown import Markdown as RichMarkdown
 from core.runtime import WORKDIR, AGENT_DIR, MODEL
+import tempfile
+import webbrowser
+
+
+def _extract_mermaid_blocks(text: str) -> list[str]:
+    """Extract all ```mermaid ... ``` code blocks from markdown text."""
+    pattern = re.compile(r"```mermaid\s*\n(.*?)```", re.DOTALL)
+    return [m.group(1).strip() for m in pattern.finditer(text)]
+
+
+def _open_mermaid_in_browser(blocks: list[str], title: str = "Mermaid Diagrams") -> str | None:
+    """Generate a temp HTML with Mermaid.js CDN and open in default browser.
+    Returns the path to the temp HTML file, or None on error."""
+    if not blocks:
+        return None
+    diagrams_html = ""
+    for i, block in enumerate(blocks, 1):
+        diagrams_html += f'<div class="diagram"><h3>Diagram {i}</h3><pre class="mermaid">{block}</pre></div>\n'
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>{title}</title>
+<style>
+  body {{ font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: #1a1a2e; color: #eee; padding: 2rem; }}
+  .diagram {{ background: #16213e; border-radius: 12px; padding: 1.5rem; margin: 1.5rem 0; box-shadow: 0 4px 20px rgba(0,0,0,0.3); }}
+  .diagram h3 {{ color: #00ffcc; margin-top: 0; }}
+  .mermaid {{ display: flex; justify-content: center; }}
+  h1 {{ color: #a855f7; }}
+</style>
+</head>
+<body>
+<h1>{title}</h1>
+<p style="color:#888">Found {len(blocks)} diagram(s). Rendered with Mermaid.js.</p>
+{diagrams_html}
+<script type="module">
+  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+  mermaid.initialize({{ startOnLoad: true, theme: 'dark' }});
+</script>
+</body>
+</html>"""
+    try:
+        fd, path = tempfile.mkstemp(suffix=".html", prefix="mermaid_")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(html)
+        webbrowser.open(f"file://{path}")
+        return path
+    except Exception:
+        return None
 
 class FileViewer(ModalScreen):
     """Screen to display file content."""
@@ -23,6 +73,8 @@ class FileViewer(ModalScreen):
         Binding("escape", "dismiss", "Close File"),
         Binding("d", "toggle_diff", "Toggle Git Diff"),
         Binding("v", "toggle_ref_view", "Toggle Ref View"),
+        Binding("m", "toggle_markdown", "Toggle Markdown"),
+        Binding("g", "view_mermaid", "View Mermaid"),
     ]
     
     def __init__(self, filepath: Path, **kwargs):
@@ -34,6 +86,8 @@ class FileViewer(ModalScreen):
         self.repo_root: Path | None = None
         self.current_ref = "HEAD"
         self.show_ref_view = False
+        self.is_markdown_file = False
+        self.render_as_markdown = False
         
     def compose(self) -> ComposeResult:
         with Vertical(id="file_viewer_container"):
@@ -47,7 +101,7 @@ class FileViewer(ModalScreen):
             with VerticalScroll(id="file_viewer_scroll"):
                 yield Static(id="file_viewer_code")
             yield Label(
-                "💡 ESC close  |  D toggle diff  |  V view selected version  |  Select chooses Git ref",
+                "💡 ESC close  |  D diff  |  V version  |  M markdown  |  G mermaid  |  Select chooses Git ref",
                 id="file_viewer_footer",
                 markup=False,
             )
@@ -82,6 +136,9 @@ class FileViewer(ModalScreen):
                 self.original_lang = lang_map[ext]
             else:
                 self.original_lang = "text"
+            if ext == ".md":
+                self.is_markdown_file = True
+                self.render_as_markdown = False
             self._render_code(self.original_text, self.original_lang)
         except Exception as e:
             self.original_text = f"Error reading file: {e}"
@@ -143,15 +200,18 @@ class FileViewer(ModalScreen):
 
     def _render_code(self, content: str, language: str) -> None:
         code_widget = self.query_one("#file_viewer_code", Static)
-        code_widget.update(
-            Syntax(
-                content,
-                language or "text",
-                theme="monokai",
-                line_numbers=True,
-                word_wrap=False,
+        if self.render_as_markdown and language == "markdown":
+            code_widget.update(RichMarkdown(content))
+        else:
+            code_widget.update(
+                Syntax(
+                    content,
+                    language or "text",
+                    theme="monokai",
+                    line_numbers=True,
+                    word_wrap=False,
+                )
             )
-        )
 
     def _render_diff(self) -> None:
         if not self.repo_root:
@@ -224,6 +284,14 @@ class FileViewer(ModalScreen):
             event.stop()
             event.prevent_default()
             self.action_toggle_ref_view()
+        elif event.key in ("m", "M"):
+            event.stop()
+            event.prevent_default()
+            self.action_toggle_markdown()
+        elif event.key in ("g", "G"):
+            event.stop()
+            event.prevent_default()
+            self.action_view_mermaid()
 
     def on_select_changed(self, event: Select.Changed) -> None:
         if event.select.id != "file_viewer_history":
@@ -255,6 +323,34 @@ class FileViewer(ModalScreen):
             self._render_ref_content()
         else:
             self._render_code(self.original_text, self.original_lang)
+
+    def action_toggle_markdown(self):
+        if not self.is_markdown_file:
+            return
+        self.render_as_markdown = not self.render_as_markdown
+        if self.show_diff:
+            self._render_diff()
+        elif self.show_ref_view:
+            self._render_ref_content()
+        else:
+            self._render_code(self.original_text, self.original_lang)
+
+    def action_view_mermaid(self):
+        """Extract mermaid blocks from the current file content and open in browser."""
+        text = self.original_text
+        blocks = _extract_mermaid_blocks(text)
+        if not blocks:
+            self.app.notify("No mermaid diagrams found in this file.", severity="warning", timeout=3)
+            return
+        try:
+            rel = self.filepath.relative_to(WORKDIR)
+        except ValueError:
+            rel = self.filepath.name
+        path = _open_mermaid_in_browser(blocks, title=f"Mermaid — {rel}")
+        if path:
+            self.app.notify(f"Opened {len(blocks)} diagram(s) in browser", timeout=3)
+        else:
+            self.app.notify("Failed to open mermaid diagrams", severity="error", timeout=3)
 
 class ChatInput(TextArea):
     """A multi-line text area that submits on Enter and allows newlines with Shift+Enter or Ctrl+J."""
@@ -511,6 +607,7 @@ class ZeroCodeApp(App):
         Binding("ctrl+r", "refresh_explorer", "Refresh Explorer", show=True),
         Binding("f5", "refresh_explorer", "Refresh Explorer", show=False),
         Binding("ctrl+y", "copy_last_reply", "Copy Reply", show=True),
+        Binding("ctrl+g", "open_mermaid", "Open Mermaid", show=True),
     ]
 
     def __init__(self, *args, **kwargs):
@@ -560,6 +657,7 @@ class ZeroCodeApp(App):
         self._tool_hide_timer = None
         self._chat_input_placeholder = os.getenv("CHAT_INPUT_PLACEHOLDER", "请输入内容后按回车发送 (Shift+Enter 换行)")
         self._last_reply_text: str = ""
+        self._pending_mermaid_blocks: list[str] = []
 
     def _cancel_timer(self, timer_obj):
         if timer_obj is None:
@@ -760,7 +858,7 @@ Type your request below to get started. Use `/help` for commands.
                 text = (markdown_text or "").rstrip()
                 self._last_reply_text = text
                 meta = self._agent_meta_line(duration) if duration is not None else self._agent_meta_line()
-                wrapper = Container(Static(text), Static(meta, classes="agent-meta"), classes="chat-agent")
+                wrapper = Container(Markdown(text), Static(meta, classes="agent-meta"), classes="chat-agent")
                 wrapper.styles.border_left = ("solid", "blue")
                 wrapper.styles.padding = (0, 1)
                 wrapper.styles.margin = (1, 0)
@@ -873,6 +971,22 @@ Type your request below to get started. Use `/help` for commands.
         except Exception as e:
             self.notify(f"Copy failed: {e}", severity="error", timeout=3)
 
+    async def action_open_mermaid(self) -> None:
+        """Open pending mermaid diagrams (from last agent reply) in browser."""
+        blocks = self._pending_mermaid_blocks
+        if not blocks:
+            # Try extracting from the last reply text
+            if self._last_reply_text:
+                blocks = _extract_mermaid_blocks(self._last_reply_text)
+        if not blocks:
+            self.notify("No Mermaid diagrams found in the last reply.", severity="warning", timeout=3)
+            return
+        path = _open_mermaid_in_browser(blocks, title="Mermaid — Agent Reply")
+        if path:
+            self.notify(f"Opened {len(blocks)} diagram(s) in browser", timeout=3)
+        else:
+            self.notify("Failed to open mermaid diagrams", severity="error", timeout=3)
+
     def stream_start(self):
         self._cancel_timer(self._think_hide_timer)
         self._think_hide_timer = None
@@ -953,6 +1067,20 @@ Type your request below to get started. Use `/help` for commands.
         self._flush_stream_pending()
         if self._stream_text_buffer.strip():
             self._last_reply_text = self._stream_text_buffer.rstrip()
+            # Render final streaming output as Markdown
+            if self._stream_text_widget is not None:
+                try:
+                    self._stream_text_widget.update(RichMarkdown(self._last_reply_text))
+                except Exception:
+                    pass
+            # Auto-detect mermaid blocks and offer to open in browser
+            mermaid_blocks = _extract_mermaid_blocks(self._last_reply_text)
+            if mermaid_blocks:
+                self._pending_mermaid_blocks = mermaid_blocks
+                self.notify(
+                    f"Found {len(mermaid_blocks)} Mermaid diagram(s) — press Ctrl+G to open in browser",
+                    timeout=6,
+                )
         if self._think_live_buffer.strip():
             self._cancel_timer(self._think_hide_timer)
 
