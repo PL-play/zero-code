@@ -3,16 +3,17 @@ import os
 import re
 import sys
 import time
+import asyncio
 from datetime import datetime
 from io import StringIO
 from pathlib import Path
 
 import yaml
-from anthropic.types import MessageParam
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
+from llm_client.interface import LLMRequest
 
 from core.runtime import AGENT_DIR, MODEL, SKILLS_DIR, WORKDIR, client
 
@@ -58,7 +59,58 @@ class TUIAdapter:
     def new_tool_cycle(self):
         self._tool_buffer = []
 
-    def tool_call(self, name: str, output: str, is_sub: bool = False):
+    def _tool_brief(self, name: str, tool_input: dict | None, output: str) -> str:
+        tool_input = tool_input or {}
+
+        def _rel_path(p: str) -> str:
+            if not p:
+                return "?"
+            try:
+                raw = Path(p)
+                resolved = raw.resolve() if raw.is_absolute() else (WORKDIR / raw).resolve()
+                return str(resolved.relative_to(WORKDIR))
+            except Exception:
+                return p
+
+        if name == "read_file":
+            path = _rel_path(str(tool_input.get("path") or ""))
+            lines = None
+            m = re.search(r"\((\d+) lines total\)", str(output))
+            if m:
+                lines = m.group(1)
+            else:
+                m = re.search(r"\(showing lines \d+-\d+ of (\d+)\)", str(output))
+                if m:
+                    lines = m.group(1)
+            suffix = f" ({lines} lines)" if lines else ""
+            return f"read_file: {path}{suffix}"
+        if name == "glob":
+            pattern = str(tool_input.get("pattern") or "*")
+            return f"glob: {pattern}"
+        if name == "grep":
+            pattern = str(tool_input.get("pattern") or "")
+            return f"grep: {pattern}"
+        if name == "bash":
+            command = str(tool_input.get("command") or "").strip().replace("\n", " ")
+            workdir_str = str(WORKDIR)
+            if workdir_str in command:
+                command = command.replace(workdir_str + "/", "")
+                command = command.replace(workdir_str, ".")
+            if len(command) > 60:
+                command = command[:57] + "..."
+            return f"bash: {command}" if command else "bash"
+        if name == "edit_file":
+            path = _rel_path(str(tool_input.get("path") or ""))
+            return f"edit_file: {path}"
+        if name == "write_file":
+            path = _rel_path(str(tool_input.get("path") or ""))
+            return f"write_file: {path}"
+        preview = str(output).strip().splitlines()[0] if str(output).strip() else "(no output)"
+        if len(preview) > 50:
+            preview = preview[:47] + "..."
+        return f"{name}: {preview}"
+
+    def tool_call(self, name: str, output: str, is_sub: bool = False, tool_input: dict | None = None):
         ts = self._ts()
         prefix = "  sub" if is_sub else "    "
         out_preview = output.replace("\n", " ").strip()
@@ -74,6 +126,9 @@ class TUIAdapter:
         detailed_entry = f"[{ts}] {prefix} {name}:\n{output_str}\n" + "-"*40
 
         self._safe_dispatch("agent_log", detailed_entry)
+        if not is_sub:
+            brief = self._tool_brief(name, tool_input, output)
+            self._safe_dispatch("append_tool_brief", brief)
         self._safe_dispatch("set_status", f"Running: {name}...")
 
     def task_start(self, desc: str, prompt_preview: str):
@@ -118,6 +173,23 @@ class TUIAdapter:
         # but if we wanted to push it here, we'd do:
         # self._safe_dispatch("append_chat", text, "agent")
         self._safe_dispatch("set_status", "Idle")
+
+    def stream_start(self):
+        self._safe_dispatch("stream_start")
+
+    def stream_text(self, text: str):
+        if text:
+            self._safe_dispatch("append_stream_text", text)
+
+    def stream_think(self, think: str):
+        if think:
+            self._safe_dispatch("append_stream_think", think)
+
+    def stream_end(self):
+        self._safe_dispatch("stream_end")
+
+    def set_round_tools_present(self, has_tools: bool):
+        self._safe_dispatch("set_round_tools_present", has_tools)
 
     def nag_reminder(self):
         ts = self._ts()
@@ -300,16 +372,37 @@ class ContextManager:
         self.recent_files = self.recent_files[-5:]
 
     def update_usage(self, response) -> dict:
-        usage = response.usage
-        self.last_input_tokens = getattr(usage, "input_tokens", 0)
-        self.total_input_tokens += self.last_input_tokens
-        self.total_output_tokens += getattr(usage, "output_tokens", 0)
-        self.cache_read_tokens += getattr(usage, "cache_read_input_tokens", 0) or 0
+        usage = None
+        if hasattr(response, "token_usage") and response.token_usage is not None:
+            usage = response.token_usage.as_dict()
+        elif hasattr(response, "usage"):
+            usage = response.usage
+
+        def _pick(dct: dict, keys: list[str]) -> int:
+            for key in keys:
+                val = dct.get(key)
+                if isinstance(val, (int, float)):
+                    return int(val)
+            return 0
+
+        if isinstance(usage, dict):
+            input_tokens = _pick(usage, ["prompt_tokens", "input_tokens"])
+            output_tokens = _pick(usage, ["completion_tokens", "output_tokens"])
+            cache_read = _pick(usage, ["cache_read_input_tokens", "cache_read_tokens"])
+        else:
+            input_tokens = int(getattr(usage, "input_tokens", 0) or getattr(usage, "prompt_tokens", 0) or 0)
+            output_tokens = int(getattr(usage, "output_tokens", 0) or getattr(usage, "completion_tokens", 0) or 0)
+            cache_read = int(getattr(usage, "cache_read_input_tokens", 0) or getattr(usage, "cache_read_tokens", 0) or 0)
+
+        self.last_input_tokens = input_tokens
+        self.total_input_tokens += input_tokens
+        self.total_output_tokens += output_tokens
+        self.cache_read_tokens += cache_read
         self.api_calls += 1
         return {
             "input": self.last_input_tokens,
-            "output": getattr(usage, "output_tokens", 0),
-            "cache_read": getattr(usage, "cache_read_input_tokens", 0) or 0,
+            "output": output_tokens,
+            "cache_read": cache_read,
             "total_in": self.total_input_tokens,
             "total_out": self.total_output_tokens,
             "calls": self.api_calls,
@@ -363,27 +456,32 @@ class ContextManager:
 
         tool_result_indices = []
         for i, msg in enumerate(messages):
+            if msg.get("role") == "tool":
+                content = msg.get("content", "")
+                if isinstance(content, str) and len(content) > MICRO_SIZE_LIMIT:
+                    tool_result_indices.append((i, msg, None))
+                continue
             if isinstance(msg.get("content"), list):
                 for block in msg["content"]:
                     if isinstance(block, dict) and block.get("type") == "tool_result":
                         content = block.get("content", "")
                         if isinstance(content, str) and len(content) > MICRO_SIZE_LIMIT:
-                            tool_result_indices.append((i, block))
+                            tool_result_indices.append((i, msg, block))
 
         if len(tool_result_indices) <= MICRO_HOT_TAIL:
             return
 
         cold = tool_result_indices[:-MICRO_HOT_TAIL]
-        for _, block in cold:
-            content = block["content"]
+        for _, msg, block in cold:
+            content = msg.get("content", "") if block is None else block.get("content", "")
             if content.startswith("[tool output saved to"):
                 continue
             self._file_counter += 1
             cache_path = CACHE_DIR / f"tool_{self._file_counter:05d}.md"
 
-            tool_id = block.get("tool_use_id", "")
+            tool_id = msg.get("tool_call_id", "") if block is None else block.get("tool_use_id", "")
             call_info = tool_call_index.get(tool_id, {})
-            tool_name = call_info.get("name", "unknown")
+            tool_name = msg.get("name", "unknown") if block is None else call_info.get("name", "unknown")
             tool_input = call_info.get("input", {})
             input_preview = json.dumps(tool_input, ensure_ascii=False, default=str)
             if len(input_preview) > 500:
@@ -397,9 +495,13 @@ class ContextManager:
                 f"{content}\n"
             )
             cache_path.write_text(md)
-            block["content"] = (
+            replaced = (
                 f"[tool output saved to {cache_path.relative_to(AGENT_DIR)}, {tool_name}, {len(content)} chars]"
             )
+            if block is None:
+                msg["content"] = replaced
+            else:
+                block["content"] = replaced
 
     @staticmethod
     def _build_tool_call_index(messages: list) -> dict:
@@ -407,6 +509,24 @@ class ContextManager:
         for msg in messages:
             if msg.get("role") != "assistant":
                 continue
+            tool_calls = msg.get("tool_calls", [])
+            if isinstance(tool_calls, list):
+                for tc in tool_calls:
+                    if not isinstance(tc, dict):
+                        continue
+                    fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+                    args = fn.get("arguments")
+                    if isinstance(args, str):
+                        try:
+                            args = json.loads(args)
+                        except Exception:
+                            args = {}
+                    if not isinstance(args, dict):
+                        args = {}
+                    index[str(tc.get("id", ""))] = {
+                        "name": fn.get("name", tc.get("name", "unknown")),
+                        "input": args,
+                    }
             content = msg.get("content", [])
             if not isinstance(content, list):
                 continue
@@ -421,7 +541,7 @@ class ContextManager:
     def should_compact(self) -> bool:
         return self.last_input_tokens > COMPACT_THRESHOLD
 
-    def compact(self, messages: list, focus: str = None) -> list:
+    async def compact_async(self, messages: list, focus: str = None) -> list:
         self._compact_count += 1
         transcript_path = CACHE_DIR / f"transcript_{int(time.time())}.jsonl"
         with open(transcript_path, "w", encoding="utf-8") as f:
@@ -433,7 +553,7 @@ class ContextManager:
         if focus:
             focus_instruction = f"\nFocus especially on: {focus}\n"
 
-        compact_messages: list[MessageParam] = [{
+        compact_messages = [{
             "role": "user",
             "content": (
                 "Summarize this conversation for continuity. Include:\n"
@@ -448,13 +568,19 @@ class ContextManager:
                 + conversation_text
             ),
         }]
-        summary_response = client.messages.create(
-            model=MODEL,
-            messages=compact_messages,
-            max_tokens=8000,
+        summary_response = await client.complete(
+            LLMRequest(
+                messages=compact_messages,
+                model=MODEL,
+                max_tokens=8000,
+                temperature=0,
+            )
         )
-        summary = summary_response.content[0].text
+        summary = getattr(summary_response, "raw_text", "") or getattr(summary_response, "content_text", "")
         return self._rehydrate(summary, transcript_path)
+
+    def compact(self, messages: list, focus: str = None) -> list:
+        return asyncio.run(self.compact_async(messages, focus))
 
     def _rehydrate(self, summary: str, transcript_path: Path) -> list:
         parts = [
