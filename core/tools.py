@@ -1,3 +1,4 @@
+import difflib
 import queue
 import re
 import subprocess
@@ -10,6 +11,8 @@ from core.state import SKILL_LOADER, TODO
 
 MAX_OUTPUT_LINES = 200
 SENTINEL = "___ZERO_CODE_CMD_DONE___"
+
+FILE_READ_STATE: dict[str, float] = {}
 
 
 class BashSession:
@@ -186,6 +189,7 @@ def run_read(path: str, offset: int = None, limit: int = None) -> str:
         header = f"({total} lines total)"
         if start > 0 or end < total:
             header = f"(showing lines {start+1}-{end} of {total})"
+        FILE_READ_STATE[str(fp)] = fp.stat().st_mtime
         return header + "\n" + "\n".join(numbered)
     except Exception as e:
         return f"Error: {e}"
@@ -220,108 +224,299 @@ def run_write(path: str, content: str) -> str:
         return f"Error: {e}"
 
 
-def _fuzzy_find(content: str, old_text: str) -> tuple[int, int] | None:
+def _check_read_state(fp: Path) -> str | None:
+    key = str(fp)
+    if key not in FILE_READ_STATE:
+        return f"Error: File has not been read yet. Use read_file first before editing: {fp.name}"
+    if fp.exists():
+        current_mtime = fp.stat().st_mtime
+        if current_mtime > FILE_READ_STATE[key]:
+            return f"Error: File was modified since last read. Re-read it first: {fp.name}"
+    return None
+
+
+def _detect_line_ending(content: str) -> str:
+    crlf_idx = content.find("\r\n")
+    lf_idx = content.find("\n")
+    if lf_idx == -1:
+        return "\n"
+    if crlf_idx == -1:
+        return "\n"
+    return "\r\n" if crlf_idx < lf_idx else "\n"
+
+
+def _normalize_to_lf(text: str) -> str:
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _restore_line_endings(text: str, ending: str) -> str:
+    return text.replace("\n", "\r\n") if ending == "\r\n" else text
+
+
+def _strip_bom(content: str) -> tuple[str, str]:
+    if content.startswith("\ufeff"):
+        return "\ufeff", content[1:]
+    return "", content
+
+
+def _normalize_unicode(text: str) -> str:
+    lines = text.split("\n")
+    stripped = "\n".join(line.rstrip() for line in lines)
+    result = re.sub(r"[\u2018\u2019\u201a\u201b]", "'", stripped)
+    result = re.sub(r"[\u201c\u201d\u201e\u201f]", '"', result)
+    result = re.sub(r"[\u2010\u2011\u2012\u2013\u2014\u2015\u2212]", "-", result)
+    result = re.sub(r"[\u00a0\u2002-\u200a\u202f\u205f\u3000]", " ", result)
+    return result
+
+
+def _fuzzy_find(content: str, old_text: str) -> tuple[int, int, str] | None:
+    """4-level matching: exact -> CRLF-normalized -> Unicode-normalized -> line-trimmed.
+    Returns (start, end, content_for_replacement) or None.
+    """
     idx = content.find(old_text)
     if idx != -1:
-        return idx, idx + len(old_text)
+        return idx, idx + len(old_text), content
 
-    stripped = old_text.strip()
-    for _, line in enumerate(content.splitlines(keepends=True)):
-        if stripped in line.strip():
-            break
-    else:
-        norm_content = re.sub(r"\s+", " ", content)
-        norm_old = re.sub(r"\s+", " ", old_text.strip())
-        pos = norm_content.find(norm_old)
-        if pos == -1:
-            return None
-        char_count = 0
-        real_start = 0
-        for ci, ch in enumerate(content):
-            if char_count == pos:
-                real_start = ci
-                break
-            if ch.isspace():
-                while char_count < len(norm_content) and norm_content[char_count] == " ":
-                    char_count += 1
-            else:
-                char_count += 1
-        real_end = min(real_start + len(old_text) + 50, len(content))
-        chunk = content[real_start:real_end]
-        norm_chunk = re.sub(r"\s+", " ", chunk)
-        if norm_old in norm_chunk:
-            return real_start, real_end
-        return None
+    lf_content = _normalize_to_lf(content)
+    lf_old = _normalize_to_lf(old_text)
+    idx = lf_content.find(lf_old)
+    if idx != -1:
+        return idx, idx + len(lf_old), lf_content
+
+    uni_content = _normalize_unicode(lf_content)
+    uni_old = _normalize_unicode(lf_old)
+    idx = uni_content.find(uni_old)
+    if idx != -1:
+        return idx, idx + len(uni_old), uni_content
+
+    trim_content = "\n".join(line.strip() for line in lf_content.split("\n"))
+    trim_old = "\n".join(line.strip() for line in lf_old.split("\n"))
+    idx = trim_content.find(trim_old)
+    if idx != -1:
+        return idx, idx + len(trim_old), trim_content
 
     return None
 
 
-def _edit_context(lines: list[str], change_start: int, change_end: int, ctx: int = 3) -> str:
-    lo = max(0, change_start - ctx)
-    hi = min(len(lines), change_end + ctx)
-    numbered = [f"{lo + i + 1:>6}|{l}" for i, l in enumerate(lines[lo:hi])]
-    return "\n".join(numbered)
+def _generate_diff(old_content: str, new_content: str, context: int = 3) -> str:
+    old_lines = old_content.split("\n")
+    new_lines = new_content.split("\n")
+    diff = difflib.unified_diff(old_lines, new_lines, lineterm="", n=context)
+    return "\n".join(diff)
 
 
 def run_edit(
     path: str,
-    old_text: str = None,
-    new_text: str = None,
-    insert_line: int = None,
-    insert_text: str = None,
+    old_text: str,
+    new_text: str,
+    replace_all: bool = False,
 ) -> str:
     try:
         fp = safe_path(path)
-        content = fp.read_text()
-        lines = content.splitlines(keepends=True)
 
-        if insert_line is not None and insert_text is not None:
-            idx = max(0, min(insert_line, len(lines)))
-            new_lines_to_insert = insert_text if insert_text.endswith("\n") else insert_text + "\n"
-            lines.insert(idx, new_lines_to_insert)
-            fp.write_text("".join(lines))
-            result_lines = "".join(lines).splitlines()
-            context = _edit_context(result_lines, idx, idx + insert_text.count("\n") + 1)
-            return f"Inserted at line {idx} in {path}\n{context}"
+        read_err = _check_read_state(fp)
+        if read_err:
+            return read_err
 
-        if old_text is None or new_text is None:
-            return "Error: provide old_text+new_text for replacement, or insert_line+insert_text for insertion"
+        raw_content = fp.read_text()
+        bom, content = _strip_bom(raw_content)
+        original_ending = _detect_line_ending(content)
+        normalized = _normalize_to_lf(content)
+        norm_old = _normalize_to_lf(old_text)
+        norm_new = _normalize_to_lf(new_text)
 
-        count = content.count(old_text)
-        if count == 0:
-            match = _fuzzy_find(content, old_text)
+        if norm_old == norm_new:
+            return "Error: old_text and new_text are identical."
+
+        if replace_all:
+            match = _fuzzy_find(normalized, norm_old)
             if match is None:
                 return f"Error: Text not found in {path}. Provide a larger unique snippet."
-            start, end = match
-            updated = content[:start] + new_text + content[end:]
-            fp.write_text(updated)
-            result_lines = updated.splitlines()
-            line_idx = content[:start].count("\n")
-            context = _edit_context(result_lines, line_idx, line_idx + new_text.count("\n") + 1)
-            return f"Edited {path} (fuzzy match)\n{context}"
+            _, _, base = match
+            if base == normalized:
+                count = base.count(norm_old)
+                updated = base.replace(norm_old, norm_new)
+            else:
+                search_key = _normalize_unicode(norm_old)
+                count = base.count(search_key)
+                updated = base.replace(search_key, norm_new)
+        else:
+            match = _fuzzy_find(normalized, norm_old)
+            if match is None:
+                return f"Error: Text not found in {path}. Provide a larger unique snippet."
+            start, end, base = match
 
-        if count > 1:
-            positions = []
-            search_start = 0
-            for _ in range(min(count, 5)):
-                idx = content.find(old_text, search_start)
-                if idx == -1:
+            fuzzy_base = _normalize_unicode(_normalize_to_lf(base))
+            fuzzy_old = _normalize_unicode(norm_old)
+            occurrence_count = fuzzy_base.split(fuzzy_old)
+            count = len(occurrence_count) - 1
+            if count > 1:
+                positions = []
+                search_start = 0
+                for _ in range(min(count, 5)):
+                    idx = fuzzy_base.find(fuzzy_old, search_start)
+                    if idx == -1:
+                        break
+                    line_no = fuzzy_base[:idx].count("\n") + 1
+                    positions.append(str(line_no))
+                    search_start = idx + 1
+                return (
+                    f"Error: old_text matches {count} locations in {path} (lines: {', '.join(positions)}). "
+                    "Provide more surrounding context to make it unique, or use replace_all=true."
+                )
+
+            updated = base[:start] + norm_new + base[end:]
+            count = 1
+
+        diff_output = _generate_diff(base, updated)
+        final = bom + _restore_line_endings(updated, original_ending)
+        fp.write_text(final)
+        FILE_READ_STATE[str(fp)] = fp.stat().st_mtime
+
+        label = "replace_all" if replace_all else ("fuzzy match" if base != normalized else "exact")
+        return f"Edited {path} ({label}, {count} replacement{'s' if count != 1 else ''})\n{diff_output}"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+def _seek_context(lines: list[str], context_lines: list[str], start_from: int = 0) -> int | None:
+    """Find the position in lines where context_lines match, starting from start_from.
+    Uses 4-level tolerance: exact -> Unicode-normalized -> trailing-whitespace-trimmed -> fully-trimmed.
+    Returns the line index or None.
+    """
+    if not context_lines:
+        return start_from
+
+    def _match_line(file_line: str, ctx_line: str) -> bool:
+        if file_line == ctx_line:
+            return True
+        if _normalize_unicode(file_line) == _normalize_unicode(ctx_line):
+            return True
+        if file_line.rstrip() == ctx_line.rstrip():
+            return True
+        if file_line.strip() == ctx_line.strip():
+            return True
+        return False
+
+    for i in range(start_from, len(lines)):
+        if _match_line(lines[i], context_lines[0]):
+            if len(context_lines) == 1:
+                return i
+            all_match = True
+            for j, ctx in enumerate(context_lines[1:], 1):
+                if i + j >= len(lines) or not _match_line(lines[i + j], ctx):
+                    all_match = False
                     break
-                line_no = content[:idx].count("\n") + 1
-                positions.append(str(line_no))
-                search_start = idx + 1
-            return (
-                f"Error: old_text matches {count} locations in {path} (lines: {', '.join(positions)}). "
-                "Provide more surrounding context to make it unique."
-            )
+            if all_match:
+                return i
+    return None
 
-        updated = content.replace(old_text, new_text, 1)
-        fp.write_text(updated)
-        result_lines = updated.splitlines()
-        change_line = content.find(old_text)
-        line_idx = content[:change_line].count("\n")
-        context = _edit_context(result_lines, line_idx, line_idx + new_text.count("\n") + 1)
-        return f"Edited {path}\n{context}"
+
+def _parse_patch(patch_text: str) -> list[dict]:
+    """Parse a V4A-style patch into a list of hunks.
+    Each hunk: {"context": [...], "changes": [("-", line), ("+", line), (" ", line), ...]}
+    """
+    hunks = []
+    current_context = []
+    current_changes = []
+
+    for raw_line in patch_text.split("\n"):
+        if raw_line.startswith("@@"):
+            if current_changes:
+                hunks.append({"context": current_context, "changes": current_changes})
+                current_context = []
+                current_changes = []
+            ctx_text = raw_line[2:].strip() if len(raw_line) > 2 else ""
+            if ctx_text:
+                current_context.append(ctx_text)
+        elif raw_line.startswith("-"):
+            current_changes.append(("-", raw_line[1:]))
+        elif raw_line.startswith("+"):
+            current_changes.append(("+", raw_line[1:]))
+        elif raw_line.startswith(" "):
+            current_changes.append((" ", raw_line[1:]))
+
+    if current_changes:
+        hunks.append({"context": current_context, "changes": current_changes})
+
+    return hunks
+
+
+def run_apply_patch(path: str, patch: str) -> str:
+    try:
+        fp = safe_path(path)
+
+        read_err = _check_read_state(fp)
+        if read_err:
+            return read_err
+
+        raw_content = fp.read_text()
+        bom, content = _strip_bom(raw_content)
+        original_ending = _detect_line_ending(content)
+        normalized = _normalize_to_lf(content)
+        lines = normalized.split("\n")
+
+        hunks = _parse_patch(patch)
+        if not hunks:
+            return "Error: No valid hunks found in patch. Use @@ for context and +/- for changes."
+
+        cursor = 0
+
+        for hi, hunk in enumerate(hunks):
+            ctx = hunk["context"]
+            changes = hunk["changes"]
+
+            if ctx:
+                pos = _seek_context(lines, ctx, cursor)
+                if pos is None:
+                    return (
+                        f"Error: Could not locate context for hunk {hi + 1} in {path}. "
+                        f"Context: {ctx!r}"
+                    )
+                cursor = pos + len(ctx)
+            else:
+                if hi == 0:
+                    cursor = 0
+
+            apply_at = cursor
+            i = apply_at
+            result_insert = []
+            for op, text in changes:
+                if op == "-":
+                    if i >= len(lines):
+                        return (
+                            f"Error: Hunk {hi + 1} tries to delete beyond end of file. "
+                            f"Expected: {text!r}"
+                        )
+                    file_line = lines[i]
+                    if not (file_line == text or file_line.strip() == text.strip()
+                            or _normalize_unicode(file_line) == _normalize_unicode(text)):
+                        return (
+                            f"Error: Hunk {hi + 1} delete mismatch at line {i + 1}. "
+                            f"Expected: {text!r}, Found: {file_line!r}"
+                        )
+                    i += 1
+                elif op == "+":
+                    result_insert.append(text)
+                elif op == " ":
+                    if i >= len(lines):
+                        return (
+                            f"Error: Hunk {hi + 1} context line beyond end of file. "
+                            f"Expected: {text!r}"
+                        )
+                    i += 1
+                    result_insert.append(lines[i - 1])
+
+            lines[apply_at:i] = result_insert
+            cursor = apply_at + len(result_insert)
+
+        new_content = "\n".join(lines)
+        diff_output = _generate_diff(normalized, new_content)
+        final = bom + _restore_line_endings(new_content, original_ending)
+        fp.write_text(final)
+        FILE_READ_STATE[str(fp)] = fp.stat().st_mtime
+
+        return f"Patched {path} ({len(hunks)} hunk{'s' if len(hunks) != 1 else ''})\n{diff_output}"
     except Exception as e:
         return f"Error: {e}"
 
@@ -397,8 +592,9 @@ TOOL_HANDLERS = {
     "read_file": lambda **kw: run_read(kw["path"], kw.get("offset"), kw.get("limit")),
     "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
     "edit_file": lambda **kw: run_edit(
-        kw["path"], kw.get("old_text"), kw.get("new_text"), kw.get("insert_line"), kw.get("insert_text")
+        kw["path"], kw["old_text"], kw["new_text"], kw.get("replace_all", False)
     ),
+    "apply_patch": lambda **kw: run_apply_patch(kw["path"], kw["patch"]),
     "glob": lambda **kw: run_glob(kw["pattern"], kw.get("path", ".")),
     "grep": lambda **kw: run_grep(kw["pattern"], kw.get("path", "."), kw.get("include"), kw.get("max_results", 50)),
     "load_skill": lambda **kw: SKILL_LOADER.get_content(kw["name"]),
@@ -443,17 +639,40 @@ BASE_TOOLS = [
     },
     {
         "name": "edit_file",
-        "description": "Edit a file via str_replace (old_text->new_text) or insert at line number. Returns context around the change. Fails if old_text matches multiple locations.",
+        "description": "Replace exact text in a file (old_text->new_text). old_text must be unique unless replace_all=true. You MUST read_file before editing. Returns a unified diff of changes.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "path": {"type": "string"},
-                "old_text": {"type": "string", "description": "Text to find and replace (must be unique)"},
-                "new_text": {"type": "string", "description": "Replacement text"},
-                "insert_line": {"type": "integer", "description": "Line number to insert after (0=start of file)"},
-                "insert_text": {"type": "string", "description": "Text to insert"},
+                "old_text": {"type": "string", "description": "Text to find and replace (must be unique unless replace_all=true)"},
+                "new_text": {"type": "string", "description": "Replacement text (must differ from old_text)"},
+                "replace_all": {"type": "boolean", "description": "Replace all occurrences (default: false)"},
             },
-            "required": ["path"],
+            "required": ["path", "old_text", "new_text"],
+        },
+    },
+    {
+        "name": "apply_patch",
+        "description": (
+            "Apply a patch to a file using @@ context lines for positioning and +/- for line changes. "
+            "Efficient for large edits — only specify a few context lines to locate the change, not the entire old text. "
+            "You MUST read_file before patching.\n"
+            "Format:\n"
+            "@@ context line to locate position\n"
+            "-line to remove\n"
+            "+line to add\n"
+            " unchanged context line (space prefix)\n"
+            "@@ next change location\n"
+            "-old line\n"
+            "+new line"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "File path to patch"},
+                "patch": {"type": "string", "description": "Patch content with @@ context, -deletions, +additions"},
+            },
+            "required": ["path", "patch"],
         },
     },
     {
@@ -494,7 +713,7 @@ BASE_TOOLS = [
 ]
 
 CHILD_TOOLS = BASE_TOOLS
-EXPLORE_TOOLS = [t for t in BASE_TOOLS if t["name"] not in ("write_file", "edit_file")]
+EXPLORE_TOOLS = [t for t in BASE_TOOLS if t["name"] not in ("write_file", "edit_file", "apply_patch")]
 PARENT_TOOLS = BASE_TOOLS + [
     {
         "name": "sub_agent",

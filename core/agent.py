@@ -36,8 +36,9 @@ Model: {MODEL}
 # Tool Usage
 - bash: persistent session — cwd and env vars survive across calls. Use restart=true to reset. Avoid dangerous commands (rm -rf /, sudo, etc.).
 - read_file: returns numbered lines (\"  1|code\"). Use offset/limit for large files. Pass a directory path to list contents. Always read before editing.
-- write_file: creates parent dirs automatically. Use for new files only; prefer edit_file for existing files.
-- edit_file: str_replace (old_text→new_text) or insert (insert_line+insert_text). old_text must be unique in the file — include more surrounding context if ambiguous. Returns context around the change so you can verify.
+- write_file: creates parent dirs automatically. Use for new files only; prefer edit_file or apply_patch for existing files.
+- edit_file: str_replace (old_text→new_text). old_text must be unique — include more context if ambiguous. Set replace_all=true to replace every occurrence. You MUST read_file before editing. Best for small changes (<20 lines).
+- apply_patch: apply a patch using @@ context lines for positioning and +/- for line changes. Only specify a few context lines to locate the edit — no need to repeat the entire old text. You MUST read_file before patching. Best for large edits, multi-location changes, or when old text is very long. Format: "@@ context_line\n-old_line\n+new_line".
 - glob: find files by pattern (e.g. \"*.py\", \"**/*.ts\"). Prefer over `bash find`.
 - grep: search file contents by regex. Prefer over `bash grep/rg`. Supports include filter.
 - load_skill: load specialized knowledge before tackling unfamiliar domains. Check available skills first.
