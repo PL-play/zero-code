@@ -139,6 +139,14 @@ class TUIAdapter:
             self._safe_dispatch("append_tool_brief", brief)
         self._safe_dispatch("set_status", f"Running: {name}...")
 
+        # Send shell command outputs to the terminal tab
+        if name in ("bash", "shell", "run_command"):
+            cmd_str = ""
+            if tool_input:
+                cmd_str = tool_input.get("command", "")
+            term_output = f"[bold #00FFCC]$[/bold #00FFCC] {cmd_str}\n{output_str}" if cmd_str else output_str
+            self._safe_dispatch("terminal_log", term_output)
+
         if name in ("edit_file", "apply_patch") and not output.startswith("Error"):
             parts = output.split("\n", 1)
             summary = parts[0]
@@ -183,22 +191,44 @@ class TUIAdapter:
                 capture_output=True, text=True, timeout=3,
             )
             if r.returncode == 0 and r.stdout.strip():
-                return r.stdout.strip()[:2].strip() or "M"
+                raw = r.stdout.strip()[:2].strip() or "M"
+                # Map git porcelain status to human-readable labels
+                status_map = {
+                    "??": "NEW",
+                    "A": "NEW",
+                    "M": "MOD",
+                    "D": "DEL",
+                    "R": "REN",
+                    "C": "CPY",
+                }
+                return status_map.get(raw, raw)
             return " "
         except Exception:
             return "?"
 
     def _render_file_stats(self) -> str:
         if not self._file_stats:
-            return "Files Changed:\n  (none)"
-        lines = ["Files Changed:"]
+            return "[bold #FACC15]Files Changed:[/bold #FACC15]\n  [dim](none)[/dim]"
+        lines = ["[bold #FACC15]Files Changed:[/bold #FACC15]"]
         for path, stats in sorted(self._file_stats.items()):
             git_st = self._get_git_file_status(path)
             added = stats["added"]
             deleted = stats["deleted"]
             edits = stats["edits"]
             edit_word = "edit" if edits == 1 else "edits"
-            lines.append(f"  {git_st} {path}  +{added} -{deleted} ({edits} {edit_word})")
+            # Color for git status
+            if git_st == "NEW":
+                st_tag = "[bold #55AAFF]NEW[/bold #55AAFF]"
+            elif git_st == "DEL":
+                st_tag = "[bold #FF5555]DEL[/bold #FF5555]"
+            elif git_st == "MOD":
+                st_tag = "[bold #FFAA44]MOD[/bold #FFAA44]"
+            else:
+                st_tag = f"[dim]{git_st}[/dim]"
+            # Color for +/-
+            add_str = f"[#88CC88]+{added}[/#88CC88]" if added else "[dim]+0[/dim]"
+            del_str = f"[#FF8888]-{deleted}[/#FF8888]" if deleted else "[dim]-0[/dim]"
+            lines.append(f"  {st_tag} {path}  {add_str} {del_str} [dim]({edits} {edit_word})[/dim]")
         return "\n".join(lines)
 
     def task_start(self, desc: str, prompt_preview: str):
@@ -431,6 +461,7 @@ class ContextManager:
         self.total_input_tokens = 0
         self.total_output_tokens = 0
         self.cache_read_tokens = 0
+        self.reasoning_tokens = 0
         self.api_calls = 0
         self._compact_count = 0
         self.subagent_records: list[dict] = []
@@ -458,23 +489,30 @@ class ContextManager:
         if isinstance(usage, dict):
             input_tokens = _pick(usage, ["prompt_tokens", "input_tokens"])
             output_tokens = _pick(usage, ["completion_tokens", "output_tokens"])
-            cache_read = _pick(usage, ["cache_read_input_tokens", "cache_read_tokens"])
+            cache_read = _pick(usage, ["cache_read_input_tokens", "cache_read_tokens",
+                                       "cached_tokens", "cache_hit_tokens",
+                                       "prompt_cached_tokens"])
+            reasoning = _pick(usage, ["completion_reasoning_tokens", "reasoning_tokens"])
         else:
             input_tokens = int(getattr(usage, "input_tokens", 0) or getattr(usage, "prompt_tokens", 0) or 0)
             output_tokens = int(getattr(usage, "output_tokens", 0) or getattr(usage, "completion_tokens", 0) or 0)
             cache_read = int(getattr(usage, "cache_read_input_tokens", 0) or getattr(usage, "cache_read_tokens", 0) or 0)
+            reasoning = int(getattr(usage, "completion_reasoning_tokens", 0) or getattr(usage, "reasoning_tokens", 0) or 0)
 
         self.last_input_tokens = input_tokens
         self.total_input_tokens += input_tokens
         self.total_output_tokens += output_tokens
         self.cache_read_tokens += cache_read
+        self.reasoning_tokens += reasoning
         self.api_calls += 1
         return {
             "input": self.last_input_tokens,
             "output": output_tokens,
             "cache_read": cache_read,
+            "reasoning": reasoning,
             "total_in": self.total_input_tokens,
             "total_out": self.total_output_tokens,
+            "total_reasoning": self.reasoning_tokens,
             "calls": self.api_calls,
         }
 
@@ -495,6 +533,7 @@ class ContextManager:
             "input_tokens": sub_ctx.total_input_tokens,
             "output_tokens": sub_ctx.total_output_tokens,
             "cache_read": sub_ctx.cache_read_tokens,
+            "reasoning": sub_ctx.reasoning_tokens,
             "api_calls": sub_ctx.api_calls,
             "compactions": getattr(sub_ctx, "_compact_count", 0),
         }
@@ -502,23 +541,45 @@ class ContextManager:
         self.total_input_tokens += sub_ctx.total_input_tokens
         self.total_output_tokens += sub_ctx.total_output_tokens
         self.cache_read_tokens += sub_ctx.cache_read_tokens
+        self.reasoning_tokens += sub_ctx.reasoning_tokens
         self.api_calls += sub_ctx.api_calls
 
     def all_usage_summary(self) -> str:
+        """Return Rich-markup formatted usage summary for the TUI Status panel."""
+        main_in = self.total_input_tokens - sum(r['input_tokens'] for r in self.subagent_records)
+        main_out = self.total_output_tokens - sum(r['output_tokens'] for r in self.subagent_records)
+        main_reason = self.reasoning_tokens - sum(r.get('reasoning', 0) for r in self.subagent_records)
+        main_calls = self.api_calls - sum(r['api_calls'] for r in self.subagent_records)
+
         lines = [
-            f"Main:  {self.total_input_tokens - sum(r['input_tokens'] for r in self.subagent_records):,}in "
-            f"+ {self.total_output_tokens - sum(r['output_tokens'] for r in self.subagent_records):,}out "
-            f"| calls={self.api_calls - sum(r['api_calls'] for r in self.subagent_records)}",
+            "[bold #00FFCC]Token Usage[/bold #00FFCC]",
+            "",
+            "[bold #55AAFF]Main Agent[/bold #55AAFF]",
+            f"  [#88CC88]IN[/#88CC88]  {main_in:,}  [#FF8888]OUT[/#FF8888]  {main_out:,}  [#AAAAAA]calls={main_calls}[/#AAAAAA]",
         ]
+        if main_reason:
+            lines[-1] += f"  [#D8B4FE]reason={main_reason:,}[/#D8B4FE]"
+
         for i, r in enumerate(self.subagent_records):
-            lines.append(
-                f"Sub#{i+1} ({r['label']}): {r['input_tokens']:,}in + {r['output_tokens']:,}out "
-                f"| calls={r['api_calls']} compact={r['compactions']}"
-            )
-        lines.append(
-            f"Total: {self.total_input_tokens:,}in + {self.total_output_tokens:,}out "
-            f"| cache_read={self.cache_read_tokens:,} | calls={self.api_calls}"
+            lines.append(f"\n[bold #FACC15]Sub#{i+1}[/bold #FACC15] [dim]({r['label']})[/dim]")
+            sub_line = f"  [#88CC88]IN[/#88CC88]  {r['input_tokens']:,}  [#FF8888]OUT[/#FF8888]  {r['output_tokens']:,}  [#AAAAAA]calls={r['api_calls']}[/#AAAAAA]"
+            if r.get('reasoning'):
+                sub_line += f"  [#D8B4FE]reason={r['reasoning']:,}[/#D8B4FE]"
+            if r.get('compactions'):
+                sub_line += f"  compact={r['compactions']}"
+            lines.append(sub_line)
+
+        lines.append("")
+        lines.append("[bold]Session Total[/bold]")
+        total_line = (
+            f"  [bold #88CC88]IN[/bold #88CC88]  {self.total_input_tokens:,}  "
+            f"[bold #FF8888]OUT[/bold #FF8888]  {self.total_output_tokens:,}  "
+            f"[#FFAA44]cache={self.cache_read_tokens:,}[/#FFAA44]  "
+            f"[#AAAAAA]calls={self.api_calls}[/#AAAAAA]"
         )
+        if self.reasoning_tokens:
+            total_line += f"  [bold #D8B4FE]reason={self.reasoning_tokens:,}[/bold #D8B4FE]"
+        lines.append(total_line)
         return "\n".join(lines)
 
     def microcompact(self, messages: list):

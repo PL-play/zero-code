@@ -1,6 +1,6 @@
 from textual.app import App, ComposeResult
 from textual.containers import Container, Horizontal, VerticalScroll, Vertical
-from textual.widgets import DirectoryTree, TextArea, RichLog, Static, TabbedContent, TabPane, Markdown, Footer, Header, Label, Select
+from textual.widgets import DirectoryTree, TextArea, RichLog, Static, TabbedContent, TabPane, Markdown, Footer, Header, Label, Select, Input
 from textual.binding import Binding
 from textual.message import Message
 from textual import events, work
@@ -376,6 +376,24 @@ class ChatInput(TextArea):
     def action_newline(self):
         self.insert("\n")
 
+    def action_paste(self) -> None:
+        """Paste from the system clipboard (pbpaste on macOS)."""
+        if self.read_only:
+            return
+        clipboard = ""
+        try:
+            result = subprocess.run(
+                ["pbpaste"], capture_output=True, text=True, timeout=3
+            )
+            if result.returncode == 0 and result.stdout:
+                clipboard = result.stdout
+        except Exception:
+            pass
+        if clipboard:
+            start, end = self.selection
+            if res := self._replace_via_keyboard(clipboard, start, end):
+                self.move_cursor(res.end_location)
+
     async def _on_key(self, event: events.Key) -> None:
         if event.key == "enter":
             event.stop()
@@ -385,6 +403,42 @@ class ChatInput(TextArea):
             event.stop()
             event.prevent_default()
             self.action_newline()
+        else:
+            await super()._on_key(event)
+
+class TerminalInput(Input):
+    """Single-line input for the embedded terminal. Enter runs the command."""
+
+    class CommandSubmitted(Message):
+        def __init__(self, command: str) -> None:
+            self.command = command
+            super().__init__()
+
+    def __init__(self, **kwargs):
+        super().__init__(placeholder="$ type a command and press Enter...", **kwargs)
+
+    def action_paste(self) -> None:
+        """Paste from the system clipboard."""
+        clipboard = ""
+        try:
+            result = subprocess.run(
+                ["pbpaste"], capture_output=True, text=True, timeout=3
+            )
+            if result.returncode == 0 and result.stdout:
+                clipboard = result.stdout.strip()
+        except Exception:
+            pass
+        if clipboard:
+            self.insert_text_at_cursor(clipboard)
+
+    async def _on_key(self, event: events.Key) -> None:
+        if event.key == "enter":
+            event.stop()
+            event.prevent_default()
+            cmd = self.value.strip()
+            if cmd:
+                self.post_message(self.CommandSubmitted(cmd))
+                self.value = ""
         else:
             await super()._on_key(event)
 
@@ -582,6 +636,15 @@ class ZeroCodeApp(App):
         background: #1A1A24;
     }
 
+    #token_usage {
+        height: auto;
+        padding: 1;
+        margin-bottom: 1;
+        border: solid #00FFCC;
+        border-title-color: #00FFCC;
+        background: #1A1A24;
+    }
+
     .diff-block {
         border-left: solid #FACC15;
         padding: 0 1;
@@ -591,6 +654,22 @@ class ZeroCodeApp(App):
 
     .diff-block Static {
         height: auto;
+    }
+
+    #terminal_output {
+        height: 1fr;
+        color: #CCCCCC;
+        background: #0D0D11;
+        overflow-x: auto;
+    }
+
+    #terminal_input {
+        min-height: 3;
+        max-height: 3;
+        height: auto;
+        border: solid #00FFCC;
+        background: #0D0D11;
+        color: #00FFCC;
     }
 
     #debug_logs {
@@ -658,6 +737,7 @@ class ZeroCodeApp(App):
         self._chat_input_placeholder = os.getenv("CHAT_INPUT_PLACEHOLDER", "请输入内容后按回车发送 (Shift+Enter 换行)")
         self._last_reply_text: str = ""
         self._pending_mermaid_blocks: list[str] = []
+        self._terminal_bash = None  # lazy-init BashSession for Terminal tab
 
     def _cancel_timer(self, timer_obj):
         if timer_obj is None:
@@ -689,8 +769,12 @@ class ZeroCodeApp(App):
                     with TabPane("Status", id="tab-status"):
                         with VerticalScroll():
                             yield Static("TODO", id="todo_list")
-                            yield Static("Files Changed:\n  (none)", id="file_changes")
-                            yield Static("Token Usage:\nNo usage yet.", id="token_usage")
+                            yield Static("[bold #FACC15]Files Changed:[/bold #FACC15]\n  [dim](none)[/dim]", id="file_changes", markup=True)
+                            yield Static("[bold #00FFCC]Token Usage[/bold #00FFCC]\n[dim]No usage yet.[/dim]", id="token_usage", markup=True)
+                    with TabPane("Terminal", id="tab-terminal"):
+                        with Vertical():
+                            yield RichLog(id="terminal_output", wrap=True, highlight=False, markup=True, auto_scroll=True)
+                            yield TerminalInput(id="terminal_input")
                     with TabPane("Debug", id="tab-debug"):
                         yield RichLog(id="debug_logs", wrap=True, highlight=True, markup=True, auto_scroll=True)
         
@@ -941,6 +1025,20 @@ Type your request below to get started. Use `/help` for commands.
                 log = self.query_one("#debug_logs", RichLog)
                 now = datetime.now().strftime("%H:%M:%S")
                 log.write(f"[{now}] {text}")
+            except Exception:
+                pass
+                
+        if self._thread_id == threading.get_ident():
+            _log()
+        else:
+            self.call_from_thread(_log)
+
+    def terminal_log(self, text: str):
+        """Append output to the Terminal tab."""
+        def _log():
+            try:
+                log = self.query_one("#terminal_output", RichLog)
+                log.write(text)
             except Exception:
                 pass
                 
@@ -1262,6 +1360,43 @@ Type your request below to get started. Use `/help` for commands.
         event.stop()
         if event.path.is_file():
             self.push_screen(FileViewer(event.path))
+
+    async def on_terminal_input_command_submitted(self, event: TerminalInput.CommandSubmitted) -> None:
+        """Run a shell command typed in the Terminal tab."""
+        cmd = event.command
+        if not cmd:
+            return
+        log = self.query_one("#terminal_output", RichLog)
+        log.write(f"[bold #00FFCC]$[/bold #00FFCC] {cmd}")
+
+        # Lazy-init a dedicated BashSession for Terminal tab
+        if self._terminal_bash is None:
+            from core.tools import BashSession
+            self._terminal_bash = BashSession(WORKDIR)
+
+        bash = self._terminal_bash
+
+        def _run():
+            return bash.execute(cmd, timeout=30)
+
+        try:
+            output = await asyncio.to_thread(_run)
+        except Exception as e:
+            output = f"Error: {e}"
+
+        # Strip the "exit_code=N\n" prefix and display cleanly
+        lines = output.split("\n", 1)
+        if lines[0].startswith("exit_code="):
+            code = lines[0].split("=", 1)[1]
+            body = lines[1] if len(lines) > 1 else ""
+            # Strip stdout:/stderr: labels for cleaner display
+            body = body.replace("stdout:\n", "").replace("stderr:\n", "")
+            if code != "0":
+                log.write(f"{body}\n[bold #FF5555]exit {code}[/bold #FF5555]")
+            else:
+                log.write(body if body.strip() else "[dim](no output)[/dim]")
+        else:
+            log.write(output)
 
     async def on_chat_input_submitted(self, event: ChatInput.Submitted) -> None:
         query = event.value.strip()
