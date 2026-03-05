@@ -154,6 +154,9 @@ class TUIAdapter:
             self._safe_dispatch("append_diff", summary, summary, diff_body)
             self._track_file_edit(tool_input, diff_body)
 
+        if name == "write_file" and not output.startswith("Error"):
+            self._track_file_create(tool_input, output)
+
     def _track_file_edit(self, tool_input: dict | None, diff_body: str):
         tool_input = tool_input or {}
         raw_path = str(tool_input.get("path") or "")
@@ -178,6 +181,30 @@ class TUIAdapter:
             self._file_stats[rel] = {"added": 0, "deleted": 0, "edits": 0}
         self._file_stats[rel]["added"] += added
         self._file_stats[rel]["deleted"] += deleted
+        self._file_stats[rel]["edits"] += 1
+
+        self._safe_dispatch("update_file_changes", self._render_file_stats())
+        self._safe_dispatch("refresh_git_info")
+
+    def _track_file_create(self, tool_input: dict | None, output: str):
+        tool_input = tool_input or {}
+        raw_path = str(tool_input.get("path") or "")
+        if not raw_path:
+            return
+        try:
+            p = Path(raw_path)
+            resolved = p.resolve() if p.is_absolute() else (WORKDIR / p).resolve()
+            rel = str(resolved.relative_to(WORKDIR))
+        except Exception:
+            rel = raw_path
+
+        # Count lines in the written content as "added"
+        content = str(tool_input.get("content") or "")
+        added = content.count("\n") + (1 if content and not content.endswith("\n") else 0)
+
+        if rel not in self._file_stats:
+            self._file_stats[rel] = {"added": 0, "deleted": 0, "edits": 0}
+        self._file_stats[rel]["added"] += added
         self._file_stats[rel]["edits"] += 1
 
         self._safe_dispatch("update_file_changes", self._render_file_stats())
