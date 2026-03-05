@@ -332,6 +332,10 @@ async def _agent_loop_async(messages: list, stop_event: threading.Event | None =
             end="\r",
         )
 
+        # Push usage to TUI after every round (not just on todo updates)
+        if hasattr(UI, "_safe_dispatch"):
+            UI._safe_dispatch("update_usage", CTX.all_usage_summary())
+
         text = _assistant_text(response)
         tool_calls = response.get_tool_calls()
 
