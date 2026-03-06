@@ -551,6 +551,16 @@ class ZeroCodeApp(App):
         height: auto;
     }
 
+    .chat-user {
+        background: #1E2A1E;
+        border: round #2E7D32;
+    }
+
+    .chat-agent {
+        background: #1E1E28;
+        border: none;
+    }
+
     #status_bar {
         height: 1;
         background: #111118;
@@ -680,8 +690,10 @@ class ZeroCodeApp(App):
     }
     """
 
+    ALLOW_SELECT = True
+
     BINDINGS = [
-        Binding("ctrl+c", "quit", "Quit", show=True),
+        Binding("ctrl+q", "quit", "Quit", show=True),
         Binding("escape", "cancel_agent", "Stop Agent", show=True),
         Binding("ctrl+r", "refresh_explorer", "Refresh Explorer", show=True),
         Binding("f5", "refresh_explorer", "Refresh Explorer", show=False),
@@ -935,7 +947,6 @@ Type your request below to get started. Use `/help` for commands.
             
             if role == "user":
                 wrapper = Container(Markdown(f"**user [{now}]>**\n{markdown_text}"), classes="chat-user")
-                wrapper.styles.border_left = ("solid", "green")
                 wrapper.styles.padding = (0, 1)
                 wrapper.styles.margin = (1, 0)
             elif role == "agent_plain":
@@ -943,24 +954,12 @@ Type your request below to get started. Use `/help` for commands.
                 self._last_reply_text = text
                 meta = self._agent_meta_line(duration) if duration is not None else self._agent_meta_line()
                 wrapper = Container(Markdown(text), Static(meta, classes="agent-meta"), classes="chat-agent")
-                wrapper.styles.border_left = ("solid", "blue")
-                wrapper.styles.padding = (0, 1)
-                wrapper.styles.margin = (1, 0)
             elif role == "think":
                 wrapper = Container(Markdown(f"**think [{now}]>**\n{markdown_text}"), classes="chat-agent")
-                wrapper.styles.border_left = ("solid", "magenta")
-                wrapper.styles.padding = (0, 1)
-                wrapper.styles.margin = (1, 0)
             elif role == "tool":
                 wrapper = Container(Markdown(f"**tool [{now}]>**\n{markdown_text}"), classes="chat-agent")
-                wrapper.styles.border_left = ("solid", "yellow")
-                wrapper.styles.padding = (0, 1)
-                wrapper.styles.margin = (1, 0)
             else:
                 wrapper = Container(Markdown(f"**agent [{now}]>**\n{markdown_text}{dur_str}"), classes="chat-agent")
-                wrapper.styles.border_left = ("solid", "blue")
-                wrapper.styles.padding = (0, 1)
-                wrapper.styles.margin = (1, 0)
 
             chat.mount(wrapper)
             chat.scroll_end(animate=False)
@@ -998,9 +997,6 @@ Type your request below to get started. Use `/help` for commands.
         chat = self.query_one("#chat_history", VerticalScroll)
         self._stream_text_widget = Static("")
         self._stream_wrapper = Container(self._stream_text_widget, classes="chat-agent")
-        self._stream_wrapper.styles.border_left = ("solid", "blue")
-        self._stream_wrapper.styles.padding = (0, 1)
-        self._stream_wrapper.styles.margin = (1, 0)
         chat.mount(self._stream_wrapper)
         chat.scroll_end(animate=False)
 
@@ -1146,6 +1142,12 @@ Type your request below to get started. Use `/help` for commands.
         self._think_hide_timer = None
         self._stream_think_count += 1
         self._think_live_buffer += think
+        # Keep only the last N lines so the panel always shows the latest text
+        # (max-height is 6; 1 line for "thinking…" header → 5 lines of content)
+        _max_visible_lines = 5
+        lines = self._think_live_buffer.strip().splitlines()
+        if len(lines) > _max_visible_lines:
+            self._think_live_buffer = "\n".join(lines[-_max_visible_lines:]) + "\n"
         try:
             widget = self.query_one("#think_live", Static)
             widget.update(f"thinking…\n{self._think_live_buffer.strip()}")

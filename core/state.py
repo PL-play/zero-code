@@ -139,13 +139,7 @@ class TUIAdapter:
             self._safe_dispatch("append_tool_brief", brief)
         self._safe_dispatch("set_status", f"Running: {name}...")
 
-        # Send shell command outputs to the terminal tab
-        if name in ("bash", "shell", "run_command"):
-            cmd_str = ""
-            if tool_input:
-                cmd_str = tool_input.get("command", "")
-            term_output = f"[bold #00FFCC]$[/bold #00FFCC] {cmd_str}\n{output_str}" if cmd_str else output_str
-            self._safe_dispatch("terminal_log", term_output)
+        # Terminal tab is user-only; agent tool outputs go to logs instead
 
         if name in ("edit_file", "apply_patch") and not output.startswith("Error"):
             parts = output.split("\n", 1)
