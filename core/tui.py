@@ -556,6 +556,11 @@ class ZeroCodeApp(App):
         border: round #2E7D32;
     }
 
+    .chat-agent {
+        background: #1E1E28;
+        border: none;
+    }
+
     #status_bar {
         height: 1;
         background: #111118;
@@ -949,24 +954,12 @@ Type your request below to get started. Use `/help` for commands.
                 self._last_reply_text = text
                 meta = self._agent_meta_line(duration) if duration is not None else self._agent_meta_line()
                 wrapper = Container(Markdown(text), Static(meta, classes="agent-meta"), classes="chat-agent")
-                wrapper.styles.border_left = ("solid", "blue")
-                wrapper.styles.padding = (0, 1)
-                wrapper.styles.margin = (1, 0)
             elif role == "think":
                 wrapper = Container(Markdown(f"**think [{now}]>**\n{markdown_text}"), classes="chat-agent")
-                wrapper.styles.border_left = ("solid", "magenta")
-                wrapper.styles.padding = (0, 1)
-                wrapper.styles.margin = (1, 0)
             elif role == "tool":
                 wrapper = Container(Markdown(f"**tool [{now}]>**\n{markdown_text}"), classes="chat-agent")
-                wrapper.styles.border_left = ("solid", "yellow")
-                wrapper.styles.padding = (0, 1)
-                wrapper.styles.margin = (1, 0)
             else:
                 wrapper = Container(Markdown(f"**agent [{now}]>**\n{markdown_text}{dur_str}"), classes="chat-agent")
-                wrapper.styles.border_left = ("solid", "blue")
-                wrapper.styles.padding = (0, 1)
-                wrapper.styles.margin = (1, 0)
 
             chat.mount(wrapper)
             chat.scroll_end(animate=False)
@@ -1004,9 +997,6 @@ Type your request below to get started. Use `/help` for commands.
         chat = self.query_one("#chat_history", VerticalScroll)
         self._stream_text_widget = Static("")
         self._stream_wrapper = Container(self._stream_text_widget, classes="chat-agent")
-        self._stream_wrapper.styles.border_left = ("solid", "blue")
-        self._stream_wrapper.styles.padding = (0, 1)
-        self._stream_wrapper.styles.margin = (1, 0)
         chat.mount(self._stream_wrapper)
         chat.scroll_end(animate=False)
 
