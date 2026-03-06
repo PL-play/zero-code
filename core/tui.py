@@ -551,6 +551,11 @@ class ZeroCodeApp(App):
         height: auto;
     }
 
+    .chat-user {
+        background: #1E2A1E;
+        border: round #2E7D32;
+    }
+
     #status_bar {
         height: 1;
         background: #111118;
@@ -680,8 +685,10 @@ class ZeroCodeApp(App):
     }
     """
 
+    ALLOW_SELECT = True
+
     BINDINGS = [
-        Binding("ctrl+c", "quit", "Quit", show=True),
+        Binding("ctrl+q", "quit", "Quit", show=True),
         Binding("escape", "cancel_agent", "Stop Agent", show=True),
         Binding("ctrl+r", "refresh_explorer", "Refresh Explorer", show=True),
         Binding("f5", "refresh_explorer", "Refresh Explorer", show=False),
@@ -935,7 +942,6 @@ Type your request below to get started. Use `/help` for commands.
             
             if role == "user":
                 wrapper = Container(Markdown(f"**user [{now}]>**\n{markdown_text}"), classes="chat-user")
-                wrapper.styles.border_left = ("solid", "green")
                 wrapper.styles.padding = (0, 1)
                 wrapper.styles.margin = (1, 0)
             elif role == "agent_plain":
@@ -1146,6 +1152,12 @@ Type your request below to get started. Use `/help` for commands.
         self._think_hide_timer = None
         self._stream_think_count += 1
         self._think_live_buffer += think
+        # Keep only the last N lines so the panel always shows the latest text
+        # (max-height is 6; 1 line for "thinking…" header → 5 lines of content)
+        _max_visible_lines = 5
+        lines = self._think_live_buffer.strip().splitlines()
+        if len(lines) > _max_visible_lines:
+            self._think_live_buffer = "\n".join(lines[-_max_visible_lines:]) + "\n"
         try:
             widget = self.query_one("#think_live", Static)
             widget.update(f"thinking…\n{self._think_live_buffer.strip()}")
