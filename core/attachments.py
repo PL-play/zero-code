@@ -12,6 +12,7 @@ from llm_client.multimodal import create_attachment_ref
 
 ATTACHMENT_TOKEN_RE = re.compile(r"(?<!\S)@(?:\"([^\"]+)\"|'([^']+)'|(\S+))")
 ATTACHMENT_PARTIAL_RE = re.compile(r"(?<!\S)@(?:\"([^\"]*)\"|'([^']*)'|(\S*))$")
+ATTACHMENT_START_RE = re.compile(r"(?<!\S)@")
 ATTACHMENT_SUGGESTION_LIMIT = 8
 ATTACHMENT_GLOBAL_SCAN_LIMIT = 5000
 ATTACHMENT_SKIP_DIRS = {".git", ".venv", "node_modules", "__pycache__"}
@@ -249,35 +250,99 @@ def apply_attachment_parent_navigation(text: str, cursor_index: int | None = Non
     return text_before_cursor[:match.start()] + replacement + text_after_cursor
 
 
+def _resolve_attachment_file(raw_path: str) -> Path | None:
+    try:
+        resolved = safe_path(raw_path)
+    except Exception:
+        return None
+    if not resolved.is_file():
+        return None
+    return resolved
+
+
+def _find_attachment_token_bounds(text: str, start_index: int) -> tuple[int, str] | None:
+    cursor = start_index + 1
+    if cursor >= len(text):
+        return None
+
+    quote = text[cursor]
+    if quote in {'"', "'"}:
+        closing_index = text.find(quote, cursor + 1)
+        if closing_index < 0:
+            return None
+        return closing_index + 1, text[cursor + 1:closing_index]
+
+    line_end = text.find("\n", cursor)
+    if line_end < 0:
+        line_end = len(text)
+    segment = text[cursor:line_end]
+    if not segment:
+        return None
+
+    end_positions = {len(segment)}
+    for match in re.finditer(r"\s+", segment):
+        end_positions.add(match.start())
+
+    for end_pos in sorted((pos for pos in end_positions if pos > 0), reverse=True):
+        candidate = segment[:end_pos].rstrip()
+        if not candidate:
+            continue
+        if _resolve_attachment_file(candidate) is not None:
+            return cursor + end_pos, candidate
+
+    simple_match = re.match(r"\S+", segment)
+    if simple_match:
+        return cursor + simple_match.end(), simple_match.group(0)
+    return None
+
+
 def build_user_message(query: str) -> tuple[dict[str, Any], list[str]]:
     attachments: List[dict[str, Any]] = []
     warnings: List[str] = []
 
-    def _replace(match: re.Match[str]) -> str:
-        raw_path = match.group(1) or match.group(2) or match.group(3) or ""
-        try:
-            resolved = safe_path(raw_path)
-        except Exception as exc:
-            warnings.append(f"Skipping attachment `{raw_path}`: {exc}")
-            return match.group(0)
+    cleaned_parts: List[str] = []
+    cursor = 0
+    for match in ATTACHMENT_START_RE.finditer(query):
+        start = match.start()
+        if start < cursor:
+            continue
 
-        if not resolved.is_file():
-            warnings.append(f"Skipping attachment `{raw_path}`: not a file")
-            return match.group(0)
+        token = _find_attachment_token_bounds(query, start)
+        if token is None:
+            continue
+
+        end, raw_path = token
+        cleaned_parts.append(query[cursor:start])
+
+        resolved = _resolve_attachment_file(raw_path)
+        if resolved is None:
+            try:
+                safe_path(raw_path)
+                warnings.append(f"Skipping attachment `{raw_path}`: not a file")
+            except Exception as exc:
+                warnings.append(f"Skipping attachment `{raw_path}`: {exc}")
+            cleaned_parts.append(query[start:end])
+            cursor = end
+            continue
 
         try:
             attachment = create_attachment_ref(resolved)
         except Exception as exc:
             warnings.append(f"Skipping attachment `{raw_path}`: {exc}")
-            return match.group(0)
+            cleaned_parts.append(query[start:end])
+            cursor = end
+            continue
 
         if attachment.get("kind") not in {"image", "pdf"}:
-            return raw_path
+            cleaned_parts.append(raw_path)
+            cursor = end
+            continue
 
         attachments.append(attachment)
-        return ""
+        cursor = end
 
-    cleaned_query = ATTACHMENT_TOKEN_RE.sub(_replace, query)
+    cleaned_parts.append(query[cursor:])
+    cleaned_query = "".join(cleaned_parts)
     cleaned_query = re.sub(r"\s{2,}", " ", cleaned_query).strip()
 
     if not attachments:
@@ -288,8 +353,7 @@ def build_user_message(query: str) -> tuple[dict[str, Any], list[str]]:
         _display_path(Path(str(attachment.get("path") or attachment.get("filename") or "attachment")))
         for attachment in attachments
     ]
-    # attachment_path_text = "\n".join(f"[Attached path: {path}]" for path in attachment_paths if path)
-    attachment_path_text = None
+    attachment_path_text = "\n".join(f"[Attached path: {path}]" for path in attachment_paths if path)
     content: List[dict[str, Any]] = []
     if cleaned_query and attachment_path_text:
         content.append({"type": "text", "text": f"{cleaned_query}\n\n{attachment_path_text}"})

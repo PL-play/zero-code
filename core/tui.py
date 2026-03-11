@@ -28,6 +28,20 @@ import tempfile
 import webbrowser
 
 
+_BROWSER_OPENABLE_EXTENSIONS = {
+    ".pdf",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".webp",
+    ".bmp",
+    ".svg",
+    ".tif",
+    ".tiff",
+}
+
+
 def _extract_mermaid_blocks(text: str) -> list[str]:
     """Extract all ```mermaid ... ``` code blocks from markdown text."""
     pattern = re.compile(r"```mermaid\s*\n(.*?)```", re.DOTALL)
@@ -74,6 +88,34 @@ def _open_mermaid_in_browser(blocks: list[str], title: str = "Mermaid Diagrams")
     except Exception:
         return None
 
+
+def _open_local_paths_in_browser(paths: list[str | Path]) -> int:
+    opened = 0
+    for raw_path in paths:
+        try:
+            path = Path(raw_path).expanduser().resolve()
+            if not path.exists():
+                continue
+            if webbrowser.open(path.as_uri()):
+                opened += 1
+        except Exception:
+            continue
+    return opened
+
+
+def _is_browser_openable_path(path: Path) -> bool:
+    return path.suffix.lower() in _BROWSER_OPENABLE_EXTENSIONS
+
+
+def _open_path_in_browser(path: str | Path) -> bool:
+    try:
+        resolved = Path(path).expanduser().resolve()
+        if not resolved.exists():
+            return False
+        return bool(webbrowser.open(resolved.as_uri()))
+    except Exception:
+        return False
+
 class FileViewer(ModalScreen):
     """Screen to display file content."""
     
@@ -91,6 +133,7 @@ class FileViewer(ModalScreen):
         self.show_diff = False
         self.original_text = ""
         self.original_lang = ""
+        self.is_browser_openable_file = _is_browser_openable_path(filepath)
         self.repo_root: Path | None = None
         self.current_ref = "HEAD"
         self.show_ref_view = False
@@ -109,7 +152,7 @@ class FileViewer(ModalScreen):
             with VerticalScroll(id="file_viewer_scroll"):
                 yield Static(id="file_viewer_code")
             yield Label(
-                "💡 ESC close  |  D diff  |  V version  |  M markdown  |  G mermaid  |  Select chooses Git ref",
+                "💡 ESC close  |  D diff  |  V version  |  M markdown  |  G open/mermaid  |  Select chooses Git ref",
                 id="file_viewer_footer",
                 markup=False,
             )
@@ -135,6 +178,16 @@ class FileViewer(ModalScreen):
             history_select.set_options([("No Git history", "NO_GIT")])
             history_select.value = "NO_GIT"
             history_select.disabled = True
+
+        if self.is_browser_openable_file:
+            ext = self.filepath.suffix.lower() or "file"
+            self.original_text = (
+                f"Preview is not rendered inline for `{ext}` files.\n\n"
+                f"Press G to open this file in your default browser."
+            )
+            self.original_lang = "text"
+            self._render_code(self.original_text, self.original_lang)
+            return
         
         try:
             self.original_text = self.filepath.read_text(encoding="utf-8")
@@ -344,7 +397,14 @@ class FileViewer(ModalScreen):
             self._render_code(self.original_text, self.original_lang)
 
     def action_view_mermaid(self):
-        """Extract mermaid blocks from the current file content and open in browser."""
+        """Open the current file in browser when appropriate, otherwise handle Mermaid diagrams."""
+        if self.is_browser_openable_file:
+            if _open_path_in_browser(self.filepath):
+                self.app.notify(f"Opened {self.filepath.name} in browser", timeout=3)
+            else:
+                self.app.notify(f"Failed to open {self.filepath.name} in browser", severity="error", timeout=3)
+            return
+
         text = self.original_text
         blocks = _extract_mermaid_blocks(text)
         if not blocks:
@@ -856,6 +916,7 @@ class ZeroCodeApp(App):
         Binding("f5", "refresh_explorer", "Refresh Explorer", show=False),
         Binding("ctrl+y", "copy_last_reply", "Copy Reply", show=True),
         Binding("ctrl+g", "open_mermaid", "Open Mermaid", show=True),
+        Binding("ctrl+o", "open_last_image", "Open Image", show=True),
     ]
 
     def __init__(self, *args, **kwargs):
@@ -906,6 +967,7 @@ class ZeroCodeApp(App):
         self._chat_input_placeholder = os.getenv("CHAT_INPUT_PLACEHOLDER", "请输入内容后按回车发送 (Shift+Enter 换行)")
         self._last_reply_text: str = ""
         self._pending_mermaid_blocks: list[str] = []
+        self._pending_image_paths: list[str] = []
         self._terminal_bash = None  # lazy-init BashSession for Terminal tab
 
     def _cancel_timer(self, timer_obj):
@@ -1278,6 +1340,31 @@ Type your request below to get started. Use `/help` for commands.
         else:
             self.notify("Failed to open mermaid diagrams", severity="error", timeout=3)
 
+    async def action_open_last_image(self) -> None:
+        paths = list(self._pending_image_paths)
+        if not paths:
+            self.notify("No generated or edited image available to open.", severity="warning", timeout=3)
+            return
+        opened = _open_local_paths_in_browser(paths)
+        if opened <= 0:
+            self.notify("Failed to open image in browser.", severity="error", timeout=3)
+            return
+        if opened == 1:
+            self.notify(f"Opened image in browser: {paths[0]}", timeout=3)
+        else:
+            self.notify(f"Opened {opened} images in browser", timeout=3)
+
+    def set_pending_image_paths(self, paths: list[str], tool_name: str = "image tool"):
+        filtered = [str(path) for path in paths if str(path).strip()]
+        self._pending_image_paths = filtered
+        if not filtered:
+            return
+        image_word = "image" if len(filtered) == 1 else "images"
+        self.notify(
+            f"{tool_name} produced {len(filtered)} {image_word} — press Ctrl+O to open in browser",
+            timeout=5,
+        )
+
     def stream_start(self):
         self._cancel_timer(self._think_hide_timer)
         self._think_hide_timer = None
@@ -1612,6 +1699,14 @@ Type your request below to get started. Use `/help` for commands.
         if query.lower() in ("q", "exit", "quit"):
             self.exit()
             return
+
+        from core.commands import rewrite_attach_command
+
+        rewritten_query = rewrite_attach_command(query)
+        if query.startswith("/attach") and rewritten_query is None:
+            self.append_chat("Usage: `/attach <path> [prompt]`", "system")
+            return
+        query = rewritten_query or query
             
         user_message, warnings = build_user_message(query)
         self.append_chat(message_preview_text(user_message), "user")

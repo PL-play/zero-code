@@ -5,6 +5,7 @@ from dotenv import load_dotenv
 from llm_client.capabilities import capability_overrides_from_env
 from llm_client.interface import OpenAICompatibleChatConfig
 from llm_client.llm_factory import OpenAICompatibleChatLLMService
+from llm_client.qwen_image import qwen_image_config_from_env, qwen_image_edit_config_from_env
 
 load_dotenv(override=True)
 
@@ -21,6 +22,8 @@ _cfg = OpenAICompatibleChatConfig(
     capability_overrides=capability_overrides_from_env(os.environ),
 )
 client = OpenAICompatibleChatLLMService(_cfg)
+IMAGE_GENERATION_CONFIG = qwen_image_config_from_env(os.environ)
+IMAGE_EDIT_CONFIG = qwen_image_edit_config_from_env(os.environ)
 
 
 def safe_path(p: str) -> Path:
