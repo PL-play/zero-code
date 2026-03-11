@@ -8,6 +8,7 @@ model utilities, but adapted to zrag's `LLMService` Protocol.
 
 from __future__ import annotations
 
+import json
 import inspect
 import logging
 import asyncio
@@ -17,6 +18,7 @@ from typing import Any, AsyncIterator, Dict, List, Optional, Sequence, Tuple
 
 from openai import AsyncOpenAI
 
+from .capabilities import ModelCapabilities, resolve_model_capabilities
 from .interface import LLMService, OpenAICompatibleChatConfig, LLMTokenUsage, LLMRequest, LLMResponse, \
     LLMStreamChunk
 from .llm_utils import parse_json_from_model_output_detailed
@@ -30,6 +32,26 @@ except Exception as e:  # pragma: no cover
     ChatCompletionMessage = Any  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
+
+
+def _sanitize_debug_payload(value: Any) -> Any:
+    if isinstance(value, dict):
+        sanitized: Dict[str, Any] = {}
+        for key, item in value.items():
+            if key == "url" and isinstance(item, str) and item.startswith("data:"):
+                prefix, _, payload = item.partition(",")
+                sanitized[key] = f"{prefix},<base64:{len(payload)} chars>"
+            else:
+                sanitized[key] = _sanitize_debug_payload(item)
+        return sanitized
+    if isinstance(value, list):
+        return [_sanitize_debug_payload(item) for item in value]
+    return value
+
+
+def _format_messages_for_debug(messages: Sequence[Dict[str, Any]]) -> str:
+    sanitized = _sanitize_debug_payload(list(messages))
+    return json.dumps(sanitized, ensure_ascii=False, indent=2)
 
 
 
@@ -46,6 +68,11 @@ class OpenAICompatibleChatLLMService(LLMService):
         self._cfg = cfg
         self._client: Any = None
         self._last_usage: Dict[str, Any] = {}
+        self._capabilities: ModelCapabilities = resolve_model_capabilities(
+            cfg.model,
+            cfg.base_url,
+            cfg.capability_overrides,
+        )
 
         logger.info(
             "GraphExtractor LLM: base_url=%s model=%s timeout_s=%s max_tokens=%s temperature=%s api_key=%s",
@@ -60,6 +87,10 @@ class OpenAICompatibleChatLLMService(LLMService):
     def get_last_token_usage(self) -> Dict[str, Any]:
         return dict(self._last_usage or {})
 
+    @property
+    def capabilities(self) -> ModelCapabilities:
+        return self._capabilities
+
     def _ensure_client(self) -> Any:
         if self._client is not None:
             return self._client
@@ -71,6 +102,22 @@ class OpenAICompatibleChatLLMService(LLMService):
             timeout=self._cfg.timeout_s,
         )
         return self._client
+
+    def _emit_debug_payload(self, *, method: str, messages: Sequence[Dict[str, Any]], kwargs: Dict[str, Any]) -> None:
+        payload_text = _format_messages_for_debug(messages)
+        header = (
+            f"[llm:{method}] model={kwargs.get('model') or self._cfg.model} "
+            f"image_input={self._capabilities.supports_image_input} "
+            f"pdf_chat={self._capabilities.supports_pdf_input_chat} "
+            f"data_url={self._capabilities.supports_data_url}"
+        )
+        logger.info("%s messages=%s", header, payload_text)
+        try:
+            from core.state import UI
+
+            UI._safe_dispatch("system_log", f"{header}\nmessages={payload_text}")
+        except Exception:
+            pass
 
     async def close(self) -> None:
         """
@@ -664,10 +711,13 @@ class OpenAICompatibleChatLLMService(LLMService):
                 return [{"index": 0, "type": "function", "function": fc}]
             return None
 
+        rendered_messages = current_request.to_messages(self._capabilities)
+        self._emit_debug_payload(method="stream", messages=rendered_messages, kwargs=stream_kwargs)
+
         while True:
             async def _open_stream() -> Any:
                 return await client.chat.completions.create(
-                    messages=current_request.to_messages(),
+                    messages=rendered_messages,
                     **stream_kwargs
                 )
 
@@ -739,6 +789,8 @@ class OpenAICompatibleChatLLMService(LLMService):
                     e,
                 )
                 current_request = self._build_resume_request(request, aggregated_text)
+                rendered_messages = current_request.to_messages(self._capabilities)
+                self._emit_debug_payload(method="stream-resume", messages=rendered_messages, kwargs=stream_kwargs)
                 continue
 
         # Final chunk carries best-effort usage + last raw event so callers can inspect finish_reason, tool_calls, etc.
@@ -765,11 +817,15 @@ class OpenAICompatibleChatLLMService(LLMService):
         model = str(kwargs.get("model") or self._cfg.model)
         temperature = float(kwargs.get("temperature", self._cfg.temperature))
         max_tokens = int(kwargs.get("max_tokens", self._cfg.max_tokens))
+        message_list = [dict(message) for message in messages]
+        debug_kwargs = dict(kwargs)
+        debug_kwargs.update({"model": model, "temperature": temperature, "max_tokens": max_tokens})
+        self._emit_debug_payload(method="chat_completion", messages=message_list, kwargs=debug_kwargs)
 
         async def _call() -> Any:
             return await client.chat.completions.create(
                 model=model,
-                messages=list(messages),
+                messages=message_list,
                 temperature=temperature,
                 max_tokens=max_tokens,
                 **{k: v for k, v in kwargs.items() if k not in {"model", "temperature", "max_tokens"}},

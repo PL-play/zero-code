@@ -15,6 +15,14 @@ import subprocess
 from datetime import datetime
 from rich.syntax import Syntax
 from rich.markdown import Markdown as RichMarkdown
+from core.attachments import (
+    apply_attachment_parent_navigation,
+    apply_attachment_suggestion,
+    build_user_message,
+    get_attachment_query_at_cursor,
+    get_attachment_suggestions,
+    message_preview_text,
+)
 from core.runtime import WORKDIR, AGENT_DIR, MODEL
 import tempfile
 import webbrowser
@@ -354,6 +362,9 @@ class FileViewer(ModalScreen):
 
 class ChatInput(TextArea):
     """A multi-line text area that submits on Enter and allows newlines with Shift+Enter or Ctrl+J."""
+
+    ATTACHMENT_SUGGESTION_FETCH_LIMIT = 64
+    ATTACHMENT_PREVIEW_WINDOW = 8
     
     BINDINGS = [
         Binding("ctrl+j", "newline", "New Line", show=False),
@@ -365,8 +376,19 @@ class ChatInput(TextArea):
             self.value = value
             super().__init__()
 
+    class SuggestionChanged(Message):
+        """Posted when @ path suggestions change."""
+        def __init__(self, query: str | None, suggestions: list[dict[str, str]], selected_index: int) -> None:
+            self.query = query
+            self.suggestions = suggestions
+            self.selected_index = selected_index
+            super().__init__()
+
     def on_mount(self):
         self.soft_wrap = True
+        self._attachment_query: str | None = None
+        self._attachment_suggestions: list[dict[str, str]] = []
+        self._attachment_selected_index = 0
 
     def action_submit(self):
         text = self.text.strip()
@@ -375,6 +397,98 @@ class ChatInput(TextArea):
 
     def action_newline(self):
         self.insert("\n")
+
+    def _cursor_index(self) -> int:
+        row, column = self.selection.start
+        lines = self.text.split("\n")
+        return sum(len(line) + 1 for line in lines[:row]) + column
+
+    def _refresh_attachment_suggestions(self) -> None:
+        query = get_attachment_query_at_cursor(self.text, self._cursor_index())
+        if query is None:
+            self._attachment_query = None
+            self._attachment_suggestions = []
+            self._attachment_selected_index = 0
+            self.post_message(self.SuggestionChanged(None, [], 0))
+            return
+
+        self._attachment_query = query
+        self._attachment_suggestions = get_attachment_suggestions(
+            query,
+            limit=self.ATTACHMENT_SUGGESTION_FETCH_LIMIT,
+        )
+        self._attachment_selected_index = 0
+        self.post_message(
+            self.SuggestionChanged(
+                self._attachment_query,
+                self._attachment_suggestions,
+                self._attachment_selected_index,
+            )
+        )
+
+    def _move_attachment_selection(self, delta: int) -> None:
+        if not self._attachment_suggestions:
+            return
+        self._attachment_selected_index = (self._attachment_selected_index + delta) % len(self._attachment_suggestions)
+        self.post_message(
+            self.SuggestionChanged(
+                self._attachment_query,
+                self._attachment_suggestions,
+                self._attachment_selected_index,
+            )
+        )
+
+    def _page_attachment_selection(self, delta: int) -> None:
+        if not self._attachment_suggestions:
+            return
+        window = self.ATTACHMENT_PREVIEW_WINDOW
+        max_index = len(self._attachment_suggestions) - 1
+        self._attachment_selected_index = min(
+            max(self._attachment_selected_index + delta * window, 0),
+            max_index,
+        )
+        self.post_message(
+            self.SuggestionChanged(
+                self._attachment_query,
+                self._attachment_suggestions,
+                self._attachment_selected_index,
+            )
+        )
+
+    def _apply_selected_attachment_suggestion(self) -> bool:
+        if not self._attachment_suggestions:
+            return False
+        selected = self._attachment_suggestions[self._attachment_selected_index]["value"]
+        self.text = apply_attachment_suggestion(self.text, selected, self._cursor_index())
+        end_location = self.document.end
+        self.move_cursor(end_location)
+        self._refresh_attachment_suggestions()
+        return True
+
+    def _enter_selected_attachment_directory(self) -> bool:
+        if not self._attachment_suggestions:
+            return False
+        selected = self._attachment_suggestions[self._attachment_selected_index]
+        if selected.get("kind") != "dir":
+            return False
+        self.text = apply_attachment_suggestion(self.text, selected["value"], self._cursor_index())
+        end_location = self.document.end
+        self.move_cursor(end_location)
+        self._refresh_attachment_suggestions()
+        return True
+
+    def _navigate_attachment_parent(self) -> bool:
+        query = get_attachment_query_at_cursor(self.text, self._cursor_index())
+        if not query or not query.endswith(("/", "\\")):
+            return False
+        updated = apply_attachment_parent_navigation(self.text, self._cursor_index())
+        if updated == self.text:
+            return False
+        self.text = updated
+        end_location = self.document.end
+        self.move_cursor(end_location)
+        self._refresh_attachment_suggestions()
+        return True
 
     def action_paste(self) -> None:
         """Paste from the system clipboard (pbpaste on macOS)."""
@@ -393,9 +507,14 @@ class ChatInput(TextArea):
             start, end = self.selection
             if res := self._replace_via_keyboard(clipboard, start, end):
                 self.move_cursor(res.end_location)
+                self._refresh_attachment_suggestions()
 
     async def _on_key(self, event: events.Key) -> None:
         if event.key == "enter":
+            if self._apply_selected_attachment_suggestion():
+                event.stop()
+                event.prevent_default()
+                return
             event.stop()
             event.prevent_default()
             self.action_submit()
@@ -403,8 +522,35 @@ class ChatInput(TextArea):
             event.stop()
             event.prevent_default()
             self.action_newline()
+        elif event.key == "tab":
+            if self._apply_selected_attachment_suggestion():
+                event.stop()
+                event.prevent_default()
+                return
+            await super()._on_key(event)
+        elif event.key in ("up", "down") and self._attachment_suggestions:
+            event.stop()
+            event.prevent_default()
+            self._move_attachment_selection(-1 if event.key == "up" else 1)
+        elif event.key in ("pageup", "pagedown") and self._attachment_suggestions:
+            event.stop()
+            event.prevent_default()
+            self._page_attachment_selection(-1 if event.key == "pageup" else 1)
+        elif event.key == "right" and self._attachment_suggestions:
+            if self._enter_selected_attachment_directory():
+                event.stop()
+                event.prevent_default()
+                return
+            await super()._on_key(event)
+        elif event.key == "left":
+            if self._navigate_attachment_parent():
+                event.stop()
+                event.prevent_default()
+                return
+            await super()._on_key(event)
         else:
             await super()._on_key(event)
+            self._refresh_attachment_suggestions()
 
 class TerminalInput(Input):
     """Single-line input for the embedded terminal. Enter runs the command."""
@@ -504,6 +650,17 @@ class ZeroCodeApp(App):
         border: round #FACC15;
         background: #1E1A10;
         color: #FDE68A;
+    }
+
+    #attachment_preview {
+        display: none;
+        height: auto;
+        max-height: 8;
+        padding: 0 1;
+        margin-top: 1;
+        border: round #55AAFF;
+        background: #101826;
+        color: #B9D7FF;
     }
 
     #right_pane {
@@ -768,6 +925,7 @@ class ZeroCodeApp(App):
                 with Vertical(id="transient_panels"):
                     yield Static("", id="think_live")
                     yield Static("", id="tool_chain")
+                    yield Static("", id="attachment_preview")
                 yield ChatInput(id="chat_input")
 
             # Right Pane: Tools/Tabs
@@ -851,6 +1009,45 @@ Type your request below to get started. Use `/help` for commands.
             widget.styles.display = "block" if visible else "none"
         except Exception:
             pass
+
+    def _set_attachment_preview_visible(self, visible: bool):
+        try:
+            widget = self.query_one("#attachment_preview", Static)
+            widget.styles.display = "block" if visible else "none"
+        except Exception:
+            pass
+
+    def _render_attachment_preview(self, query: str | None, suggestions: list[dict[str, str]], selected_index: int):
+        try:
+            widget = self.query_one("#attachment_preview", Static)
+        except Exception:
+            return
+
+        if not suggestions:
+            widget.update("")
+            self._set_attachment_preview_visible(False)
+            return
+
+        preview_window = getattr(ChatInput, "ATTACHMENT_PREVIEW_WINDOW", 8)
+        window_start = max(0, selected_index - preview_window // 2)
+        window_end = min(len(suggestions), window_start + preview_window)
+        if window_end - window_start < preview_window:
+            window_start = max(0, window_end - preview_window)
+
+        lines = [f"[bold #55AAFF]Attach path[/bold #55AAFF] [dim]@{query or ''}[/dim]"]
+        for index in range(window_start, window_end):
+            item = suggestions[index]
+            marker = "[bold #FACC15]>[/bold #FACC15]" if index == selected_index else "[dim]-[/dim]"
+            lines.append(f"{marker} {item['label']}")
+        lines.append(
+            f"[dim]Showing {window_start + 1}-{window_end} of {len(suggestions)} | "
+            f"Tab/Enter choose, Up/Down move, PgUp/PgDn jump[/dim]"
+        )
+        widget.update("\n".join(lines))
+        self._set_attachment_preview_visible(True)
+
+    def on_chat_input_suggestion_changed(self, event: ChatInput.SuggestionChanged) -> None:
+        self._render_attachment_preview(event.query, event.suggestions, event.selected_index)
 
     def _render_tool_chain(self):
         try:
@@ -1416,7 +1613,10 @@ Type your request below to get started. Use `/help` for commands.
             self.exit()
             return
             
-        self.append_chat(query, "user")
+        user_message, warnings = build_user_message(query)
+        self.append_chat(message_preview_text(user_message), "user")
+        for warning in warnings:
+            self.append_chat(warning, "system")
         
         # Determine if it's a slash command or regular query
         # We will dispatch this to the agent thread
@@ -1431,7 +1631,7 @@ Type your request below to get started. Use `/help` for commands.
         self._agent_cancel_event = threading.Event()
         self.set_status("Running")
         
-        self._agent_task = asyncio.create_task(self.process_agent_query(query))
+        self._agent_task = asyncio.create_task(self.process_agent_query(user_message))
 
     def _handle_command(self, query: str):
         from core.commands import COMMAND_DISPATCH, SLASH_COMMANDS
@@ -1448,9 +1648,10 @@ Type your request below to get started. Use `/help` for commands.
             known = ", ".join(c["name"] for c in SLASH_COMMANDS)
             self.append_chat(f"Unknown command: `{cmd_name}`. Available: {known}", "system")
 
-    async def process_agent_query(self, query: str):
+    async def process_agent_query(self, user_message: dict):
         from core.agent import agent_loop
-        self.history.append({"role": "user", "content": query})
+        self.history.append(user_message)
+        query = message_preview_text(user_message)
         
         start_time = time.time()
         self.system_log(f"Starting agent query: {query}")

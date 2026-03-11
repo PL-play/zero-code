@@ -2,6 +2,7 @@ import os
 from pathlib import Path
 
 from dotenv import load_dotenv
+from llm_client.capabilities import capability_overrides_from_env
 from llm_client.interface import OpenAICompatibleChatConfig
 from llm_client.llm_factory import OpenAICompatibleChatLLMService
 
@@ -17,6 +18,7 @@ _cfg = OpenAICompatibleChatConfig(
     model=MODEL,
     base_url=os.environ["OPENAI_COMPAT_BASE_URL"],
     api_key=os.environ["OPENAI_COMPAT_API_KEY"],
+    capability_overrides=capability_overrides_from_env(os.environ),
 )
 client = OpenAICompatibleChatLLMService(_cfg)
 

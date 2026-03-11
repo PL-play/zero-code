@@ -206,6 +206,10 @@ Agent 通过 load_skill("my-skill") 加载后会获得这些知识。
 | `OPENAI_COMPAT_MODEL` | *必填* | 模型 ID |
 | `OPENAI_COMPAT_BASE_URL` | *必填* | API 地址 |
 | `OPENAI_COMPAT_API_KEY` | *必填* | API Key |
+| `OPENAI_COMPAT_SUPPORTS_IMAGE_INPUT` | 空 | 强制覆盖图片输入能力，`1/true` 开启，`0/false` 关闭 |
+| `OPENAI_COMPAT_SUPPORTS_PDF_INPUT_CHAT` | 空 | 强制覆盖 chat 路径下的 PDF 原生输入能力 |
+| `OPENAI_COMPAT_SUPPORTS_PDF_INPUT_RESPONSES` | 空 | 强制覆盖 responses 路径下的 PDF 原生输入能力 |
+| `OPENAI_COMPAT_SUPPORTS_DATA_URL` | 空 | 强制覆盖 data URL 图片传输能力 |
 | `CONTEXT_COMPACT_THRESHOLD` | `50000` | 自动压缩阈值（token） |
 | `STREAM_FLUSH_MIN_INTERVAL_S` | `0.08` | 流式刷新最小间隔（秒） |
 | `STREAM_FLUSH_MIN_CHARS` | `24` | 缓冲区刷新字符数 |

@@ -3,11 +3,12 @@ from typing import TypedDict, Literal, Any, Dict, List, Optional, AsyncIterator,
 from dataclasses import dataclass, field
 
 LLMRole = Literal["system", "user", "assistant", "tool"]
+LLMContent = str | List[Dict[str, Any]]
 
 
 class LLMMessage(TypedDict, total=False):
     role: LLMRole
-    content: str
+    content: LLMContent
     name: str
     tool_call_id: str
     # OpenAI-compatible: assistant may include tool_calls / function_call when requesting tools.
@@ -59,15 +60,25 @@ class LLMRequest:
     # Provider-specific passthrough
     extra: Dict[str, Any] = field(default_factory=dict)
 
-    def to_messages(self) -> List[Dict[str, str]]:
+    def to_messages(self, capabilities: Any = None) -> List[Dict[str, Any]]:
         """
         Normalize messages for OpenAI-compatible APIs.
         """
-        msgs: List[Dict[str, str]] = []
+        msgs: List[Dict[str, Any]] = []
         if self.system_prompt:
             msgs.append({"role": "system", "content": self.system_prompt})
-        # TypedDict is compatible with Dict[str,str] for role/content usage.
-        msgs.extend(self.messages or [])
+
+        for raw_msg in self.messages or []:
+            msg = dict(raw_msg)
+            if capabilities is not None and "content" in msg:
+                from .multimodal import render_message_content
+
+                msg["content"] = render_message_content(
+                    msg.get("content"),
+                    role=str(msg.get("role") or "user"),
+                    capabilities=capabilities,
+                )
+            msgs.append(msg)
         return msgs
 
     @classmethod
@@ -442,6 +453,7 @@ class OpenAICompatibleChatConfig:
     stream_resume_on_error: bool = False
     stream_max_restarts: int = 0
     stream_resume_instruction: str = "继续，从你上次中断的位置继续输出。不要重复已经输出的内容。"
+    capability_overrides: Dict[str, Any] = field(default_factory=dict)
 
     @property
     def is_ready(self) -> bool:
