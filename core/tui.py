@@ -26,6 +26,93 @@ from core.attachments import (
 from core.runtime import WORKDIR, AGENT_DIR, MODEL
 import tempfile
 import webbrowser
+from rich.segment import Segment
+from textual.strip import Strip
+from textual.selection import Selection
+
+
+class SelectableRichLog(RichLog):
+    """RichLog subclass that supports mouse text selection and Ctrl+C copy.
+
+    The stock RichLog (from _rich_log.py) is missing the offset metadata
+    and get_selection override needed by Textual's selection framework.
+    This subclass adds them while preserving the original rendering.
+    """
+
+    def render_line(self, y: int) -> Strip:
+        scroll_x, scroll_y = self.scroll_offset
+        virtual_y = scroll_y + y
+        line = self._render_line(
+            virtual_y, scroll_x, self.scrollable_content_region.width
+        )
+        strip = line.apply_style(self.rich_style)
+
+        # Apply visual selection highlight
+        selection = self.text_selection
+        if selection is not None:
+            span = selection.get_span(virtual_y)
+            if span is not None:
+                start_x, end_x = span
+                try:
+                    sel_style = self.screen.get_component_rich_style(
+                        "screen--selection"
+                    )
+                except Exception:
+                    from rich.style import Style as RichStyle
+                    sel_style = RichStyle(bgcolor="#3A3A5A")
+                strip = self._apply_highlight(strip, start_x, end_x, sel_style)
+
+        # Embed position metadata so the compositor can map screen coords
+        # to logical text positions — required for selection to work.
+        strip = strip.apply_offsets(scroll_x, virtual_y)
+        return strip
+
+    @staticmethod
+    def _apply_highlight(
+        strip: Strip, start_x: int, end_x: int, sel_style
+    ) -> Strip:
+        """Apply *sel_style* to the character range [start_x, end_x) of *strip*."""
+        segments: list[Segment] = []
+        x = 0
+        for segment in strip:
+            seg_len = len(segment.text)
+            seg_end = x + seg_len
+            eff_end = seg_end if end_x == -1 else end_x
+
+            if seg_end <= start_x or x >= eff_end:
+                segments.append(segment)
+            else:
+                ol_start = max(0, start_x - x)
+                ol_end = seg_len if end_x == -1 else min(seg_len, end_x - x)
+                text = segment.text
+                style = segment.style
+                if ol_start > 0:
+                    segments.append(Segment(text[:ol_start], style))
+                hi = style + sel_style if style else sel_style
+                segments.append(Segment(text[ol_start:ol_end], hi))
+                if ol_end < seg_len:
+                    segments.append(Segment(text[ol_end:], style))
+            x = seg_end
+        return Strip(segments, strip._cell_length)
+
+    # --- selection extraction -------------------------------------------
+
+    def get_selection(self, selection: Selection) -> tuple[str, str] | None:
+        text = "\n".join(strip.text for strip in self.lines)
+        return selection.extract(text), "\n"
+
+    def selection_updated(self, selection: Selection | None) -> None:
+        self._line_cache.clear()
+        # Pause auto-scroll while the user is actively selecting
+        if selection is not None:
+            if not hasattr(self, "_saved_auto_scroll"):
+                self._saved_auto_scroll = self.auto_scroll
+            self.auto_scroll = False
+        else:
+            if hasattr(self, "_saved_auto_scroll"):
+                self.auto_scroll = self._saved_auto_scroll
+                del self._saved_auto_scroll
+        self.refresh()
 
 
 _BROWSER_OPENABLE_EXTENSIONS = {
@@ -997,7 +1084,7 @@ class ZeroCodeApp(App):
                         yield DirectoryTree(str(WORKDIR), id="explorer_tree")
                     with TabPane("Agent Logs", id="tab-logs"):
                         # Re-enable Textual wrapping so Rich Tables respect exactly the remaining log width
-                        yield RichLog(id="agent_logs", wrap=True, highlight=True, markup=True, auto_scroll=True)
+                        yield SelectableRichLog(id="agent_logs", wrap=True, highlight=True, markup=True, auto_scroll=True)
                     with TabPane("Status", id="tab-status"):
                         with VerticalScroll():
                             yield Static("TODO", id="todo_list")
@@ -1005,10 +1092,10 @@ class ZeroCodeApp(App):
                             yield Static("[bold #00FFCC]Token Usage[/bold #00FFCC]\n[dim]No usage yet.[/dim]", id="token_usage", markup=True)
                     with TabPane("Terminal", id="tab-terminal"):
                         with Vertical():
-                            yield RichLog(id="terminal_output", wrap=True, highlight=False, markup=True, auto_scroll=True)
+                            yield SelectableRichLog(id="terminal_output", wrap=True, highlight=False, markup=True, auto_scroll=True)
                             yield TerminalInput(id="terminal_input")
                     with TabPane("Debug", id="tab-debug"):
-                        yield RichLog(id="debug_logs", wrap=True, highlight=True, markup=True, auto_scroll=True)
+                        yield SelectableRichLog(id="debug_logs", wrap=True, highlight=True, markup=True, auto_scroll=True)
         
         yield Horizontal(
             Label("Idle", id="run_status", classes="status-dim"),
@@ -1263,7 +1350,7 @@ Type your request below to get started. Use `/help` for commands.
         """Append to the execution log in the right pane."""
         def _log():
             try:
-                log = self.query_one("#agent_logs", RichLog)
+                log = self.query_one("#agent_logs", SelectableRichLog)
                 log.write(text)
             except Exception:
                 pass
@@ -1277,7 +1364,7 @@ Type your request below to get started. Use `/help` for commands.
         """Append to the debug execution log."""
         def _log():
             try:
-                log = self.query_one("#debug_logs", RichLog)
+                log = self.query_one("#debug_logs", SelectableRichLog)
                 now = datetime.now().strftime("%H:%M:%S")
                 log.write(f"[{now}] {text}")
             except Exception:
@@ -1292,7 +1379,7 @@ Type your request below to get started. Use `/help` for commands.
         """Append output to the Terminal tab."""
         def _log():
             try:
-                log = self.query_one("#terminal_output", RichLog)
+                log = self.query_one("#terminal_output", SelectableRichLog)
                 log.write(text)
             except Exception:
                 pass
@@ -1652,7 +1739,7 @@ Type your request below to get started. Use `/help` for commands.
         cmd = event.command
         if not cmd:
             return
-        log = self.query_one("#terminal_output", RichLog)
+        log = self.query_one("#terminal_output", SelectableRichLog)
         log.write(f"[bold #00FFCC]$[/bold #00FFCC] {cmd}")
 
         # Lazy-init a dedicated BashSession for Terminal tab
