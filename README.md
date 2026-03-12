@@ -210,11 +210,32 @@ Agent 通过 load_skill("my-skill") 加载后会获得这些知识。
 | `OPENAI_COMPAT_SUPPORTS_PDF_INPUT_CHAT` | 空 | 强制覆盖 chat 路径下的 PDF 原生输入能力 |
 | `OPENAI_COMPAT_SUPPORTS_PDF_INPUT_RESPONSES` | 空 | 强制覆盖 responses 路径下的 PDF 原生输入能力 |
 | `OPENAI_COMPAT_SUPPORTS_DATA_URL` | 空 | 强制覆盖 data URL 图片传输能力 |
+| `DASHSCOPE_API_KEY` | 空 | DashScope API Key。配置后可启用 `generate_image` 工具 |
+| `DASHSCOPE_IMAGE_MODEL` | 空 | Qwen-image 模型名，例如 `qwen-image-2.0-pro`。未配置则不注册 `generate_image` 工具 |
+| `DASHSCOPE_IMAGE_BASE_URL` | `https://dashscope.aliyuncs.com/api/v1` | DashScope 图像生成 API base URL |
+| `DASHSCOPE_IMAGE_DEFAULT_SIZE` | 空 | `generate_image` 默认尺寸，例如 `1024*1024` |
+| `DASHSCOPE_IMAGE_OUTPUT_DIR` | `outputs/generated-images` | 生成图片的默认保存目录 |
+| `DASHSCOPE_IMAGE_PROMPT_EXTEND` | `true` | 是否默认开启 prompt 智能改写 |
+| `DASHSCOPE_IMAGE_WATERMARK` | `false` | 是否默认添加水印 |
+| `DASHSCOPE_IMAGE_USE_PROXY` | `false` | 是否为图像生成请求显式启用系统/环境代理。默认关闭，避免 macOS 系统代理或本地代理软件劫持 HTTPS 导致证书错误 |
+| `DASHSCOPE_IMAGE_EDIT_MODEL` | 空 | Qwen-image 图像编辑模型名，例如 `qwen-image-2.0-pro`。未配置则不注册 `edit_image` 工具 |
+| `DASHSCOPE_IMAGE_EDIT_BASE_URL` | `https://dashscope.aliyuncs.com/api/v1` | DashScope 图像编辑 API base URL |
+| `DASHSCOPE_IMAGE_EDIT_DEFAULT_SIZE` | 空 | `edit_image` 默认输出尺寸，例如 `1024*1536` |
+| `DASHSCOPE_IMAGE_EDIT_OUTPUT_DIR` | `outputs/edited-images` | 编辑后图片的默认保存目录 |
+| `DASHSCOPE_IMAGE_EDIT_PROMPT_EXTEND` | `true` | 是否默认开启图像编辑 prompt 智能改写 |
+| `DASHSCOPE_IMAGE_EDIT_WATERMARK` | `false` | 是否默认添加水印 |
+| `DASHSCOPE_IMAGE_EDIT_USE_PROXY` | `false` | 是否为图像编辑请求显式启用系统/环境代理。默认关闭，避免本地代理导致证书校验失败 |
 | `CONTEXT_COMPACT_THRESHOLD` | `50000` | 自动压缩阈值（token） |
 | `STREAM_FLUSH_MIN_INTERVAL_S` | `0.08` | 流式刷新最小间隔（秒） |
 | `STREAM_FLUSH_MIN_CHARS` | `24` | 缓冲区刷新字符数 |
 | `THINK_PANEL_HIDE_DELAY_S` | `1.8` | 思考面板消失延迟 |
 | `TOOL_PANEL_HIDE_DELAY_S` | `2.2` | 工具链面板消失延迟 |
+
+`generate_image` 和 `edit_image` 工具对 agent 返回的是精简 JSON，而不是完整 provider 响应。成功时默认包含 `ok`、`image_count`、`primary_path`、`paths`、`request_id`、`provider`、`model`；其中 `edit_image` 额外包含 `input_paths`。失败时返回 `ok: false` 和结构化 `error` 对象，当前会区分 `configuration_error`、`invalid_input`、`input_not_found`、`input_type_error`、`input_count_error`、`network_error`、`provider_http_error`、`provider_server_error`、`download_network_error`、`download_http_error`、`download_server_error`、`empty_result` 等类别。底层 provider 原始响应仍保留在 Python 返回值中，便于后续调试或扩展，但不会直接注入工具结果上下文。
+
+当 `generate_image` 或 `edit_image` 成功产出本地图片后，TUI 会提示可按 `Ctrl+O` 用系统默认浏览器打开最近一次结果图片；如果一次返回多张图片，会依次打开这些本地文件。
+
+图像生成/编辑链路默认不会继承系统代理或环境代理，而是直接连接 DashScope，并使用 `certifi` 的 CA 包做 HTTPS 校验。这是为了避免 macOS 系统代理、V2Ray/Clash 等本地代理软件被 `urllib` 自动继承后触发 `CERTIFICATE_VERIFY_FAILED`。如果你确实需要通过代理访问，再显式设置 `DASHSCOPE_IMAGE_USE_PROXY=true` 或 `DASHSCOPE_IMAGE_EDIT_USE_PROXY=true`。
 
 ---
 

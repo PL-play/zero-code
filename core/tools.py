@@ -1,4 +1,5 @@
 import difflib
+import json
 import queue
 import re
 import subprocess
@@ -6,8 +7,15 @@ import threading
 import uuid
 from pathlib import Path
 
-from core.runtime import WORKDIR, safe_path
+from core.runtime import IMAGE_EDIT_CONFIG, IMAGE_GENERATION_CONFIG, WORKDIR, safe_path
 from core.state import SKILL_LOADER, TODO
+from llm_client.qwen_image import (
+    QwenImageError,
+    edit_image_with_qwen,
+    generate_image_with_qwen,
+    summarize_image_operation_error,
+    summarize_image_operation_result,
+)
 
 MAX_OUTPUT_LINES = 200
 SENTINEL = "___ZERO_CODE_CMD_DONE___"
@@ -164,6 +172,173 @@ class BackgroundManager:
 
 
 BG = BackgroundManager()
+
+
+def _tool_json(data: dict[str, object]) -> str:
+    return json.dumps(data, ensure_ascii=False, indent=2)
+
+
+def run_generate_image(
+    prompt: str,
+    negative_prompt: str | None = None,
+    size: str | None = None,
+    prompt_extend: bool | None = None,
+    watermark: bool | None = None,
+    output_dir: str | None = None,
+    filename_prefix: str | None = None,
+) -> str:
+    if IMAGE_GENERATION_CONFIG is None:
+        return _tool_json(
+            summarize_image_operation_error(
+                QwenImageError(
+                    "generate_image tool is not configured. Set DASHSCOPE_API_KEY and DASHSCOPE_IMAGE_MODEL.",
+                    category="configuration_error",
+                ),
+                operation="generate_image",
+            )
+        )
+
+    try:
+        resolved_output_dir = safe_path(output_dir or IMAGE_GENERATION_CONFIG.output_dir)
+        result = generate_image_with_qwen(
+            IMAGE_GENERATION_CONFIG,
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            size=size,
+            prompt_extend=prompt_extend,
+            watermark=watermark,
+            output_dir=resolved_output_dir,
+            filename_prefix=filename_prefix,
+            workspace_root=WORKDIR,
+        )
+        return _tool_json(summarize_image_operation_result(result, operation="generate_image"))
+    except Exception as e:
+        return _tool_json(summarize_image_operation_error(e, operation="generate_image"))
+
+
+def run_edit_image(
+    image_paths: list[str],
+    prompt: str,
+    negative_prompt: str | None = None,
+    size: str | None = None,
+    n: int | None = None,
+    prompt_extend: bool | None = None,
+    watermark: bool | None = None,
+    output_dir: str | None = None,
+    filename_prefix: str | None = None,
+) -> str:
+    if IMAGE_EDIT_CONFIG is None:
+        return _tool_json(
+            summarize_image_operation_error(
+                QwenImageError(
+                    "edit_image tool is not configured. Set DASHSCOPE_IMAGE_EDIT_MODEL and DASHSCOPE_API_KEY.",
+                    category="configuration_error",
+                ),
+                operation="edit_image",
+            )
+        )
+
+    resolved_image_paths: list[Path] = []
+    try:
+        resolved_output_dir = safe_path(output_dir or IMAGE_EDIT_CONFIG.output_dir)
+        resolved_image_paths = [safe_path(path) for path in image_paths]
+        result = edit_image_with_qwen(
+            IMAGE_EDIT_CONFIG,
+            prompt=prompt,
+            image_paths=resolved_image_paths,
+            negative_prompt=negative_prompt,
+            size=size,
+            n=n,
+            prompt_extend=prompt_extend,
+            watermark=watermark,
+            output_dir=resolved_output_dir,
+            filename_prefix=filename_prefix,
+            workspace_root=WORKDIR,
+        )
+        return _tool_json(
+            summarize_image_operation_result(
+                result,
+                operation="edit_image",
+                input_paths=[path.as_posix() for path in resolved_image_paths],
+            )
+        )
+    except Exception as e:
+        return _tool_json(
+            summarize_image_operation_error(
+                e,
+                operation="edit_image",
+                input_paths=[path.as_posix() for path in resolved_image_paths] if resolved_image_paths else image_paths,
+            )
+        )
+
+
+def _optional_generate_image_tools() -> list[dict[str, object]]:
+    if IMAGE_GENERATION_CONFIG is None:
+        return []
+
+    return [
+        {
+            "name": "generate_image",
+            "description": (
+                "Generate an image with Qwen-Image via DashScope and save it into the workspace. "
+                "Returns compact JSON with ok, image_count, primary_path, paths, request_id, and provider/model metadata."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "prompt": {"type": "string", "description": "Positive prompt describing the image to generate"},
+                    "negative_prompt": {"type": "string", "description": "Optional negative prompt"},
+                    "size": {"type": "string", "description": "Optional size like 1024*1024 or 1664*928"},
+                    "prompt_extend": {"type": "boolean", "description": "Override whether the provider should auto-extend the prompt"},
+                    "watermark": {"type": "boolean", "description": "Override whether the provider should add a watermark"},
+                    "output_dir": {"type": "string", "description": "Optional workspace-relative directory to save generated images"},
+                    "filename_prefix": {"type": "string", "description": "Optional file name prefix for generated images"},
+                },
+                "required": ["prompt"],
+            },
+        }
+    ]
+
+
+def _optional_edit_image_tools() -> list[dict[str, object]]:
+    if IMAGE_EDIT_CONFIG is None:
+        return []
+
+    return [
+        {
+            "name": "edit_image",
+            "description": (
+                "Edit one to three local images with Qwen-Image via DashScope and save the edited images into the workspace. "
+                "Returns compact JSON with ok, image_count, primary_path, input_paths, output paths, and provider/model metadata."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "image_paths": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "minItems": 1,
+                        "maxItems": 3,
+                        "description": "One to three workspace-relative image paths used as edit inputs",
+                    },
+                    "prompt": {"type": "string", "description": "Edit instruction describing the target image result"},
+                    "negative_prompt": {"type": "string", "description": "Optional negative prompt"},
+                    "size": {"type": "string", "description": "Optional output size like 1024*1536"},
+                    "n": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 6,
+                        "description": "Optional number of output images (1-6 for supported models)",
+                    },
+                    "prompt_extend": {"type": "boolean", "description": "Override whether the provider should auto-extend the prompt"},
+                    "watermark": {"type": "boolean", "description": "Override whether the provider should add a watermark"},
+                    "output_dir": {"type": "string", "description": "Optional workspace-relative directory to save edited images"},
+                    "filename_prefix": {"type": "string", "description": "Optional file name prefix for edited images"},
+                },
+                "required": ["image_paths", "prompt"],
+            },
+        }
+    ]
 
 
 def run_bash(command: str = None, restart: bool = False) -> str:
@@ -603,6 +778,30 @@ TOOL_HANDLERS = {
     "check_background": lambda **kw: check_background(kw.get("task_id")),
 }
 
+if IMAGE_GENERATION_CONFIG is not None:
+    TOOL_HANDLERS["generate_image"] = lambda **kw: run_generate_image(
+        kw["prompt"],
+        kw.get("negative_prompt"),
+        kw.get("size"),
+        kw.get("prompt_extend"),
+        kw.get("watermark"),
+        kw.get("output_dir"),
+        kw.get("filename_prefix"),
+    )
+
+if IMAGE_EDIT_CONFIG is not None:
+    TOOL_HANDLERS["edit_image"] = lambda **kw: run_edit_image(
+        kw["image_paths"],
+        kw["prompt"],
+        kw.get("negative_prompt"),
+        kw.get("size"),
+        kw.get("n"),
+        kw.get("prompt_extend"),
+        kw.get("watermark"),
+        kw.get("output_dir"),
+        kw.get("filename_prefix"),
+    )
+
 BASE_TOOLS = [
     {
         "name": "bash",
@@ -712,8 +911,13 @@ BASE_TOOLS = [
     },
 ]
 
+BASE_TOOLS += _optional_generate_image_tools()
+BASE_TOOLS += _optional_edit_image_tools()
+
 CHILD_TOOLS = BASE_TOOLS
-EXPLORE_TOOLS = [t for t in BASE_TOOLS if t["name"] not in ("write_file", "edit_file", "apply_patch")]
+EXPLORE_TOOLS = [
+    t for t in BASE_TOOLS if t["name"] not in ("write_file", "edit_file", "apply_patch", "generate_image", "edit_image")
+]
 PARENT_TOOLS = BASE_TOOLS + [
     {
         "name": "sub_agent",

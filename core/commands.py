@@ -9,10 +9,24 @@ from core.state import COMPACT_THRESHOLD, CTX, SKILL_LOADER, UI
 
 SLASH_COMMANDS = [
     {"name": "/help", "args": "", "description": "Show available commands"},
+    {"name": "/attach", "args": "<path> [prompt]", "description": "Attach a file using the same behavior as @path"},
     {"name": "/compact", "args": "[focus]", "description": "Compress conversation context (optional focus topic)"},
     {"name": "/context", "args": "", "description": "Show token usage and context stats"},
     {"name": "/skills", "args": "", "description": "List loaded skills"},
 ]
+
+
+def rewrite_attach_command(raw_query: str) -> str | None:
+    stripped = (raw_query or "").strip()
+    if not stripped.startswith("/attach"):
+        return stripped
+
+    remainder = stripped[len("/attach"):].strip()
+    if not remainder:
+        return None
+    if remainder.startswith("@"):
+        return remainder
+    return f"@{remainder}"
 
 
 def _handle_help(**_):

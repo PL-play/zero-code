@@ -26,6 +26,107 @@ from core.attachments import (
 from core.runtime import WORKDIR, AGENT_DIR, MODEL
 import tempfile
 import webbrowser
+from rich.segment import Segment
+from textual.strip import Strip
+from textual.selection import Selection
+
+
+class SelectableRichLog(RichLog):
+    """RichLog subclass that supports mouse text selection and Ctrl+C copy.
+
+    The stock RichLog (from _rich_log.py) is missing the offset metadata
+    and get_selection override needed by Textual's selection framework.
+    This subclass adds them while preserving the original rendering.
+    """
+
+    def render_line(self, y: int) -> Strip:
+        scroll_x, scroll_y = self.scroll_offset
+        virtual_y = scroll_y + y
+        line = self._render_line(
+            virtual_y, scroll_x, self.scrollable_content_region.width
+        )
+        strip = line.apply_style(self.rich_style)
+
+        # Apply visual selection highlight
+        selection = self.text_selection
+        if selection is not None:
+            span = selection.get_span(virtual_y)
+            if span is not None:
+                start_x, end_x = span
+                try:
+                    sel_style = self.screen.get_component_rich_style(
+                        "screen--selection"
+                    )
+                except Exception:
+                    from rich.style import Style as RichStyle
+                    sel_style = RichStyle(bgcolor="#3A3A5A")
+                strip = self._apply_highlight(strip, start_x, end_x, sel_style)
+
+        # Embed position metadata so the compositor can map screen coords
+        # to logical text positions — required for selection to work.
+        strip = strip.apply_offsets(scroll_x, virtual_y)
+        return strip
+
+    @staticmethod
+    def _apply_highlight(
+        strip: Strip, start_x: int, end_x: int, sel_style
+    ) -> Strip:
+        """Apply *sel_style* to the character range [start_x, end_x) of *strip*."""
+        segments: list[Segment] = []
+        x = 0
+        for segment in strip:
+            seg_len = len(segment.text)
+            seg_end = x + seg_len
+            eff_end = seg_end if end_x == -1 else end_x
+
+            if seg_end <= start_x or x >= eff_end:
+                segments.append(segment)
+            else:
+                ol_start = max(0, start_x - x)
+                ol_end = seg_len if end_x == -1 else min(seg_len, end_x - x)
+                text = segment.text
+                style = segment.style
+                if ol_start > 0:
+                    segments.append(Segment(text[:ol_start], style))
+                hi = style + sel_style if style else sel_style
+                segments.append(Segment(text[ol_start:ol_end], hi))
+                if ol_end < seg_len:
+                    segments.append(Segment(text[ol_end:], style))
+            x = seg_end
+        return Strip(segments, strip._cell_length)
+
+    # --- selection extraction -------------------------------------------
+
+    def get_selection(self, selection: Selection) -> tuple[str, str] | None:
+        text = "\n".join(strip.text for strip in self.lines)
+        return selection.extract(text), "\n"
+
+    def selection_updated(self, selection: Selection | None) -> None:
+        self._line_cache.clear()
+        # Pause auto-scroll while the user is actively selecting
+        if selection is not None:
+            if not hasattr(self, "_saved_auto_scroll"):
+                self._saved_auto_scroll = self.auto_scroll
+            self.auto_scroll = False
+        else:
+            if hasattr(self, "_saved_auto_scroll"):
+                self.auto_scroll = self._saved_auto_scroll
+                del self._saved_auto_scroll
+        self.refresh()
+
+
+_BROWSER_OPENABLE_EXTENSIONS = {
+    ".pdf",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".webp",
+    ".bmp",
+    ".svg",
+    ".tif",
+    ".tiff",
+}
 
 
 def _extract_mermaid_blocks(text: str) -> list[str]:
@@ -74,6 +175,34 @@ def _open_mermaid_in_browser(blocks: list[str], title: str = "Mermaid Diagrams")
     except Exception:
         return None
 
+
+def _open_local_paths_in_browser(paths: list[str | Path]) -> int:
+    opened = 0
+    for raw_path in paths:
+        try:
+            path = Path(raw_path).expanduser().resolve()
+            if not path.exists():
+                continue
+            if webbrowser.open(path.as_uri()):
+                opened += 1
+        except Exception:
+            continue
+    return opened
+
+
+def _is_browser_openable_path(path: Path) -> bool:
+    return path.suffix.lower() in _BROWSER_OPENABLE_EXTENSIONS
+
+
+def _open_path_in_browser(path: str | Path) -> bool:
+    try:
+        resolved = Path(path).expanduser().resolve()
+        if not resolved.exists():
+            return False
+        return bool(webbrowser.open(resolved.as_uri()))
+    except Exception:
+        return False
+
 class FileViewer(ModalScreen):
     """Screen to display file content."""
     
@@ -91,6 +220,7 @@ class FileViewer(ModalScreen):
         self.show_diff = False
         self.original_text = ""
         self.original_lang = ""
+        self.is_browser_openable_file = _is_browser_openable_path(filepath)
         self.repo_root: Path | None = None
         self.current_ref = "HEAD"
         self.show_ref_view = False
@@ -109,7 +239,7 @@ class FileViewer(ModalScreen):
             with VerticalScroll(id="file_viewer_scroll"):
                 yield Static(id="file_viewer_code")
             yield Label(
-                "💡 ESC close  |  D diff  |  V version  |  M markdown  |  G mermaid  |  Select chooses Git ref",
+                "💡 ESC close  |  D diff  |  V version  |  M markdown  |  G open/mermaid  |  Select chooses Git ref",
                 id="file_viewer_footer",
                 markup=False,
             )
@@ -135,6 +265,16 @@ class FileViewer(ModalScreen):
             history_select.set_options([("No Git history", "NO_GIT")])
             history_select.value = "NO_GIT"
             history_select.disabled = True
+
+        if self.is_browser_openable_file:
+            ext = self.filepath.suffix.lower() or "file"
+            self.original_text = (
+                f"Preview is not rendered inline for `{ext}` files.\n\n"
+                f"Press G to open this file in your default browser."
+            )
+            self.original_lang = "text"
+            self._render_code(self.original_text, self.original_lang)
+            return
         
         try:
             self.original_text = self.filepath.read_text(encoding="utf-8")
@@ -344,7 +484,14 @@ class FileViewer(ModalScreen):
             self._render_code(self.original_text, self.original_lang)
 
     def action_view_mermaid(self):
-        """Extract mermaid blocks from the current file content and open in browser."""
+        """Open the current file in browser when appropriate, otherwise handle Mermaid diagrams."""
+        if self.is_browser_openable_file:
+            if _open_path_in_browser(self.filepath):
+                self.app.notify(f"Opened {self.filepath.name} in browser", timeout=3)
+            else:
+                self.app.notify(f"Failed to open {self.filepath.name} in browser", severity="error", timeout=3)
+            return
+
         text = self.original_text
         blocks = _extract_mermaid_blocks(text)
         if not blocks:
@@ -856,6 +1003,7 @@ class ZeroCodeApp(App):
         Binding("f5", "refresh_explorer", "Refresh Explorer", show=False),
         Binding("ctrl+y", "copy_last_reply", "Copy Reply", show=True),
         Binding("ctrl+g", "open_mermaid", "Open Mermaid", show=True),
+        Binding("ctrl+o", "open_last_image", "Open Image", show=True),
     ]
 
     def __init__(self, *args, **kwargs):
@@ -906,6 +1054,7 @@ class ZeroCodeApp(App):
         self._chat_input_placeholder = os.getenv("CHAT_INPUT_PLACEHOLDER", "请输入内容后按回车发送 (Shift+Enter 换行)")
         self._last_reply_text: str = ""
         self._pending_mermaid_blocks: list[str] = []
+        self._pending_image_paths: list[str] = []
         self._terminal_bash = None  # lazy-init BashSession for Terminal tab
 
     def _cancel_timer(self, timer_obj):
@@ -935,7 +1084,7 @@ class ZeroCodeApp(App):
                         yield DirectoryTree(str(WORKDIR), id="explorer_tree")
                     with TabPane("Agent Logs", id="tab-logs"):
                         # Re-enable Textual wrapping so Rich Tables respect exactly the remaining log width
-                        yield RichLog(id="agent_logs", wrap=True, highlight=True, markup=True, auto_scroll=True)
+                        yield SelectableRichLog(id="agent_logs", wrap=True, highlight=True, markup=True, auto_scroll=True)
                     with TabPane("Status", id="tab-status"):
                         with VerticalScroll():
                             yield Static("TODO", id="todo_list")
@@ -943,10 +1092,10 @@ class ZeroCodeApp(App):
                             yield Static("[bold #00FFCC]Token Usage[/bold #00FFCC]\n[dim]No usage yet.[/dim]", id="token_usage", markup=True)
                     with TabPane("Terminal", id="tab-terminal"):
                         with Vertical():
-                            yield RichLog(id="terminal_output", wrap=True, highlight=False, markup=True, auto_scroll=True)
+                            yield SelectableRichLog(id="terminal_output", wrap=True, highlight=False, markup=True, auto_scroll=True)
                             yield TerminalInput(id="terminal_input")
                     with TabPane("Debug", id="tab-debug"):
-                        yield RichLog(id="debug_logs", wrap=True, highlight=True, markup=True, auto_scroll=True)
+                        yield SelectableRichLog(id="debug_logs", wrap=True, highlight=True, markup=True, auto_scroll=True)
         
         yield Horizontal(
             Label("Idle", id="run_status", classes="status-dim"),
@@ -1201,7 +1350,7 @@ Type your request below to get started. Use `/help` for commands.
         """Append to the execution log in the right pane."""
         def _log():
             try:
-                log = self.query_one("#agent_logs", RichLog)
+                log = self.query_one("#agent_logs", SelectableRichLog)
                 log.write(text)
             except Exception:
                 pass
@@ -1215,7 +1364,7 @@ Type your request below to get started. Use `/help` for commands.
         """Append to the debug execution log."""
         def _log():
             try:
-                log = self.query_one("#debug_logs", RichLog)
+                log = self.query_one("#debug_logs", SelectableRichLog)
                 now = datetime.now().strftime("%H:%M:%S")
                 log.write(f"[{now}] {text}")
             except Exception:
@@ -1230,7 +1379,7 @@ Type your request below to get started. Use `/help` for commands.
         """Append output to the Terminal tab."""
         def _log():
             try:
-                log = self.query_one("#terminal_output", RichLog)
+                log = self.query_one("#terminal_output", SelectableRichLog)
                 log.write(text)
             except Exception:
                 pass
@@ -1277,6 +1426,31 @@ Type your request below to get started. Use `/help` for commands.
             self.notify(f"Opened {len(blocks)} diagram(s) in browser", timeout=3)
         else:
             self.notify("Failed to open mermaid diagrams", severity="error", timeout=3)
+
+    async def action_open_last_image(self) -> None:
+        paths = list(self._pending_image_paths)
+        if not paths:
+            self.notify("No generated or edited image available to open.", severity="warning", timeout=3)
+            return
+        opened = _open_local_paths_in_browser(paths)
+        if opened <= 0:
+            self.notify("Failed to open image in browser.", severity="error", timeout=3)
+            return
+        if opened == 1:
+            self.notify(f"Opened image in browser: {paths[0]}", timeout=3)
+        else:
+            self.notify(f"Opened {opened} images in browser", timeout=3)
+
+    def set_pending_image_paths(self, paths: list[str], tool_name: str = "image tool"):
+        filtered = [str(path) for path in paths if str(path).strip()]
+        self._pending_image_paths = filtered
+        if not filtered:
+            return
+        image_word = "image" if len(filtered) == 1 else "images"
+        self.notify(
+            f"{tool_name} produced {len(filtered)} {image_word} — press Ctrl+O to open in browser",
+            timeout=5,
+        )
 
     def stream_start(self):
         self._cancel_timer(self._think_hide_timer)
@@ -1565,7 +1739,7 @@ Type your request below to get started. Use `/help` for commands.
         cmd = event.command
         if not cmd:
             return
-        log = self.query_one("#terminal_output", RichLog)
+        log = self.query_one("#terminal_output", SelectableRichLog)
         log.write(f"[bold #00FFCC]$[/bold #00FFCC] {cmd}")
 
         # Lazy-init a dedicated BashSession for Terminal tab
@@ -1612,6 +1786,14 @@ Type your request below to get started. Use `/help` for commands.
         if query.lower() in ("q", "exit", "quit"):
             self.exit()
             return
+
+        from core.commands import rewrite_attach_command
+
+        rewritten_query = rewrite_attach_command(query)
+        if query.startswith("/attach") and rewritten_query is None:
+            self.append_chat("Usage: `/attach <path> [prompt]`", "system")
+            return
+        query = rewritten_query or query
             
         user_message, warnings = build_user_message(query)
         self.append_chat(message_preview_text(user_message), "user")

@@ -113,6 +113,22 @@ class TUIAdapter:
         if name == "write_file":
             path = _rel_path(str(tool_input.get("path") or ""))
             return f"write_file: {path}"
+            if name in ("generate_image", "edit_image"):
+                try:
+                    payload = json.loads(str(output))
+                except Exception:
+                    payload = None
+                if isinstance(payload, dict):
+                    if payload.get("ok") is True:
+                        primary_path = payload.get("primary_path") or "(no file)"
+                        image_count = payload.get("image_count") or 0
+                        return f"{name}: ok, {image_count} image(s), {primary_path}"
+                    error = payload.get("error") or {}
+                    category = error.get("category") or "unknown_error"
+                    message = str(error.get("message") or "request failed")
+                    if len(message) > 60:
+                        message = message[:57] + "..."
+                    return f"{name}: {category}, {message}"
         preview = str(output).strip().splitlines()[0] if str(output).strip() else "(no output)"
         if len(preview) > 50:
             preview = preview[:47] + "..."
@@ -137,6 +153,15 @@ class TUIAdapter:
         if not is_sub:
             brief = self._tool_brief(name, tool_input, output)
             self._safe_dispatch("append_tool_brief", brief)
+            if name in ("generate_image", "edit_image"):
+                try:
+                    payload = json.loads(str(output))
+                except Exception:
+                    payload = None
+                if isinstance(payload, dict) and payload.get("ok") is True:
+                    paths = payload.get("paths") or []
+                    if isinstance(paths, list) and paths:
+                        self._safe_dispatch("set_pending_image_paths", [str(path) for path in paths], name)
         self._safe_dispatch("set_status", f"Running: {name}...")
 
         # Terminal tab is user-only; agent tool outputs go to logs instead
