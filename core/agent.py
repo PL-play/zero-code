@@ -36,7 +36,7 @@ Model: {MODEL}
 # Tool Usage
 - bash: persistent session — cwd and env vars survive across calls. Use restart=true to reset. Avoid dangerous commands (rm -rf /, sudo, etc.).
 - read_file: returns numbered lines (\"  1|code\"). Use offset/limit for large files. Pass a directory path to list contents. Always read before editing.
-- write_file: creates parent dirs automatically. Use for new files only; prefer edit_file or apply_patch for existing files.
+- write_file: create or overwrite a file. Both "path" and "content" are REQUIRED and must be in ONE JSON object. Escape newlines as \\n in content. Use for new files; prefer edit_file or apply_patch for existing files.
 - edit_file: str_replace (old_text→new_text). old_text must be unique — include more context if ambiguous. Set replace_all=true to replace every occurrence. You MUST read_file before editing. Best for small changes (<20 lines).
 - apply_patch: apply a patch using @@ context lines for positioning and +/- for line changes. Only specify a few context lines to locate the edit — no need to repeat the entire old text. You MUST read_file before patching. Best for large edits, multi-location changes, or when old text is very long. Format: "@@ context_line\n-old_line\n+new_line".
 - glob: find files by pattern (e.g. \"*.py\", \"**/*.ts\"). Prefer over `bash find`.
@@ -127,6 +127,46 @@ def _truncate_result(output: str) -> str:
     return s[: RESULT_MAX_CHARS - 50] + f"\n... (truncated, {len(s)} total chars)"
 
 
+DEBUG_ARG_MAX_CHARS = 300
+
+
+def _debug_tool_call(tool_call: dict[str, Any]) -> None:
+    """Log the raw tool call to the debug panel with per-param truncation."""
+    name = _tool_call_name(tool_call)
+    fn = tool_call.get("function") if isinstance(tool_call, dict) else None
+    raw_args = fn.get("arguments") if isinstance(fn, dict) else None
+
+    # Parse for structured display
+    parsed = None
+    if isinstance(raw_args, dict):
+        parsed = raw_args
+    elif isinstance(raw_args, str):
+        try:
+            parsed = json.loads(raw_args)
+        except Exception:
+            pass
+
+    lines = [f"tool_call: {name}"]
+    if isinstance(parsed, dict):
+        for k, v in parsed.items():
+            vs = str(v)
+            if len(vs) > DEBUG_ARG_MAX_CHARS:
+                vs = vs[:DEBUG_ARG_MAX_CHARS] + f"... ({len(vs)} chars total)"
+            lines.append(f"  {k}: {vs}")
+    else:
+        # Raw string (possibly malformed)
+        raw_str = str(raw_args) if raw_args is not None else "(none)"
+        if len(raw_str) > DEBUG_ARG_MAX_CHARS * 2:
+            raw_str = raw_str[:DEBUG_ARG_MAX_CHARS * 2] + f"... ({len(raw_str)} chars total)"
+        lines.append(f"  raw_arguments: {raw_str}")
+        lines.append("  ⚠ arguments is NOT valid JSON")
+
+    try:
+        UI._safe_dispatch("system_log", "\n".join(lines))
+    except Exception:
+        pass
+
+
 def _tool_call_name(tool_call: dict[str, Any]) -> str:
     fn = tool_call.get("function") if isinstance(tool_call, dict) else None
     if isinstance(fn, dict):
@@ -146,8 +186,80 @@ def _tool_call_args(tool_call: dict[str, Any]) -> dict[str, Any]:
             parsed = json.loads(args)
             return parsed if isinstance(parsed, dict) else {}
         except Exception:
-            return {}
+            pass
+        # Try to repair common JSON issues (unescaped newlines, trailing commas)
+        try:
+            repaired = args.replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+            parsed = json.loads(repaired)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            pass
     return {}
+
+
+_REQUIRED_PARAMS: dict[str, list[str]] = {
+    "write_file": ["path", "content"],
+    "read_file": ["path"],
+    "edit_file": ["path", "old_text", "new_text"],
+    "apply_patch": ["path", "patch"],
+    "bash": ["command"],
+    "glob": ["pattern"],
+    "grep": ["pattern"],
+    "load_skill": ["name"],
+    "todo": ["items"],
+    "background_run": ["command"],
+    "web_search": ["query"],
+    "generate_image": ["prompt"],
+    "edit_image": ["image_paths", "prompt"],
+}
+
+
+def _validate_tool_args(tool_name: str, tool_args: dict[str, Any]) -> str | None:
+    """Return an error string if required params are missing, else None."""
+    required = _REQUIRED_PARAMS.get(tool_name)
+    if not required:
+        return None
+    missing = [p for p in required if p not in tool_args]
+    if missing:
+        return (
+            f"Error: missing required parameter(s): {', '.join(missing)}. "
+            f"{tool_name} requires: {', '.join(required)}. "
+            f"Please provide all required parameters as a valid JSON object."
+        )
+    return None
+
+
+def _sanitize_tool_calls(tool_calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Ensure every tool call's function.arguments is valid JSON string.
+
+    When the LLM produces malformed arguments, re-serialise them so the
+    conversation history stays valid for the next API call.
+    """
+    sanitized = []
+    for tc in tool_calls:
+        tc = dict(tc)  # shallow copy
+        fn = tc.get("function")
+        if isinstance(fn, dict):
+            fn = dict(fn)
+            args = fn.get("arguments")
+            if isinstance(args, dict):
+                fn["arguments"] = json.dumps(args, ensure_ascii=False)
+            elif isinstance(args, str):
+                # Validate it's parseable JSON; if not, wrap as empty
+                try:
+                    json.loads(args)
+                except Exception:
+                    try:
+                        repaired = args.replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+                        json.loads(repaired)
+                        fn["arguments"] = repaired
+                    except Exception:
+                        fn["arguments"] = "{}"
+            elif args is None:
+                fn["arguments"] = "{}"
+            tc["function"] = fn
+        sanitized.append(tc)
+    return sanitized
 
 
 def _assistant_text(response) -> str:
@@ -199,7 +311,7 @@ async def _run_subagent_async(
 
         assistant_msg: dict[str, Any] = {"role": "assistant", "content": text}
         if tool_calls:
-            assistant_msg["tool_calls"] = tool_calls
+            assistant_msg["tool_calls"] = _sanitize_tool_calls(tool_calls)
         sub_messages.append(assistant_msg)
 
         if not tool_calls:
@@ -210,13 +322,19 @@ async def _run_subagent_async(
                 CTX.record_subagent(label, sub_ctx)
                 return "[cancelled]"
 
+            _debug_tool_call(tool_call)
             tool_name = _tool_call_name(tool_call)
             tool_args = _tool_call_args(tool_call)
-            handler = TOOL_HANDLERS.get(tool_name)
-            try:
-                output = handler(**tool_args) if handler else f"Unknown tool: {tool_name}"
-            except Exception as e:
-                output = f"Error: {e}"
+
+            validation_err = _validate_tool_args(tool_name, tool_args)
+            if validation_err:
+                output = validation_err
+            else:
+                handler = TOOL_HANDLERS.get(tool_name)
+                try:
+                    output = handler(**tool_args) if handler else f"Unknown tool: {tool_name}"
+                except Exception as e:
+                    output = f"Error: {e}"
             UI.tool_call(tool_name, output, is_sub=True, tool_input=tool_args)
             sub_messages.append(
                 {
@@ -344,7 +462,7 @@ async def _agent_loop_async(messages: list, stop_event: threading.Event | None =
 
         assistant_msg: dict[str, Any] = {"role": "assistant", "content": text}
         if tool_calls:
-            assistant_msg["tool_calls"] = tool_calls
+            assistant_msg["tool_calls"] = _sanitize_tool_calls(tool_calls)
         messages.append(assistant_msg)
 
         if not tool_calls:
@@ -355,10 +473,14 @@ async def _agent_loop_async(messages: list, stop_event: threading.Event | None =
             if _is_cancelled(stop_event):
                 return "[cancelled by user]"
 
+            _debug_tool_call(tool_call)
             tool_name = _tool_call_name(tool_call)
             tool_args = _tool_call_args(tool_call)
 
-            if tool_name == "sub_agent":
+            validation_err = _validate_tool_args(tool_name, tool_args)
+            if validation_err:
+                output = validation_err
+            elif tool_name == "sub_agent":
                 desc = tool_args.get("description", "subtask")
                 sub_mode = tool_args.get("mode", "execute")
                 prompt = tool_args.get("prompt", "")

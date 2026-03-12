@@ -894,10 +894,23 @@ BASE_TOOLS = [
     },
     {
         "name": "write_file",
-        "description": "Write content to a file (creates parent dirs). Reports overwrite if file existed.",
+        "description": (
+            "Create or overwrite a file with the given content. Creates parent directories automatically. "
+            "IMPORTANT: Both 'path' and 'content' parameters are REQUIRED and must be provided in a single valid JSON object. "
+            "For large files, write the complete content in one call — do not split across multiple calls."
+        ),
         "input_schema": {
             "type": "object",
-            "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Workspace-relative or absolute file path to write, e.g. 'src/report.md'",
+                },
+                "content": {
+                    "type": "string",
+                    "description": "The complete file content to write. Must be a valid JSON string (escape newlines as \\n, quotes as \\\")",
+                },
+            },
             "required": ["path", "content"],
         },
     },
