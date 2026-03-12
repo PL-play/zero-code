@@ -7,7 +7,7 @@ import threading
 import uuid
 from pathlib import Path
 
-from core.runtime import IMAGE_EDIT_CONFIG, IMAGE_GENERATION_CONFIG, WORKDIR, safe_path
+from core.runtime import IMAGE_EDIT_CONFIG, IMAGE_GENERATION_CONFIG, WEB_SEARCH_CONFIG, WORKDIR, safe_path
 from core.state import SKILL_LOADER, TODO
 from llm_client.qwen_image import (
     QwenImageError,
@@ -15,6 +15,12 @@ from llm_client.qwen_image import (
     generate_image_with_qwen,
     summarize_image_operation_error,
     summarize_image_operation_result,
+)
+from llm_client.web_search import (
+    WebSearchError,
+    search_web,
+    summarize_search_error,
+    summarize_search_result,
 )
 
 MAX_OUTPUT_LINES = 200
@@ -336,6 +342,57 @@ def _optional_edit_image_tools() -> list[dict[str, object]]:
                     "filename_prefix": {"type": "string", "description": "Optional file name prefix for edited images"},
                 },
                 "required": ["image_paths", "prompt"],
+            },
+        }
+    ]
+
+
+def run_web_search(
+    query: str,
+    max_results: int | None = None,
+    language: str | None = None,
+    categories: str | None = None,
+) -> str:
+    try:
+        data = search_web(
+            WEB_SEARCH_CONFIG,
+            query,
+            max_results=max_results,
+            language=language,
+            categories=categories,
+        )
+        return _tool_json(summarize_search_result(data))
+    except WebSearchError as e:
+        return _tool_json(summarize_search_error(e))
+    except Exception as e:
+        return _tool_json({"status": "error", "error": str(e)})
+
+
+def _optional_web_search_tools() -> list[dict[str, object]]:
+    if WEB_SEARCH_CONFIG is None:
+        return []
+
+    return [
+        {
+            "name": "web_search",
+            "description": (
+                "Search the web using SearXNG. Returns ranked results with title, URL, and snippet. "
+                "Use this to find current information, documentation, or answers from the internet."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Search query"},
+                    "max_results": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 20,
+                        "description": "Maximum number of results to return (default: 5)",
+                    },
+                    "language": {"type": "string", "description": "Language code, e.g. 'en', 'zh'"},
+                    "categories": {"type": "string", "description": "Comma-separated categories, e.g. 'general', 'news', 'science'"},
+                },
+                "required": ["query"],
             },
         }
     ]
@@ -802,6 +859,14 @@ if IMAGE_EDIT_CONFIG is not None:
         kw.get("filename_prefix"),
     )
 
+if WEB_SEARCH_CONFIG is not None:
+    TOOL_HANDLERS["web_search"] = lambda **kw: run_web_search(
+        kw["query"],
+        kw.get("max_results"),
+        kw.get("language"),
+        kw.get("categories"),
+    )
+
 BASE_TOOLS = [
     {
         "name": "bash",
@@ -829,10 +894,23 @@ BASE_TOOLS = [
     },
     {
         "name": "write_file",
-        "description": "Write content to a file (creates parent dirs). Reports overwrite if file existed.",
+        "description": (
+            "Create or overwrite a file with the given content. Creates parent directories automatically. "
+            "IMPORTANT: Both 'path' and 'content' parameters are REQUIRED and must be provided in a single valid JSON object. "
+            "For large files, write the complete content in one call — do not split across multiple calls."
+        ),
         "input_schema": {
             "type": "object",
-            "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Workspace-relative or absolute file path to write, e.g. 'src/report.md'",
+                },
+                "content": {
+                    "type": "string",
+                    "description": "The complete file content to write. Must be a valid JSON string (escape newlines as \\n, quotes as \\\")",
+                },
+            },
             "required": ["path", "content"],
         },
     },
@@ -913,6 +991,7 @@ BASE_TOOLS = [
 
 BASE_TOOLS += _optional_generate_image_tools()
 BASE_TOOLS += _optional_edit_image_tools()
+BASE_TOOLS += _optional_web_search_tools()
 
 CHILD_TOOLS = BASE_TOOLS
 EXPLORE_TOOLS = [
