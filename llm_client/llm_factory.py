@@ -13,6 +13,7 @@ import inspect
 import logging
 import asyncio
 import random
+import os
 from typing import cast, Callable
 from typing import Any, AsyncIterator, Dict, List, Optional, Sequence, Tuple
 
@@ -32,6 +33,35 @@ except Exception as e:  # pragma: no cover
     ChatCompletionMessage = Any  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
+
+
+_PROXY_ENV_KEYS = (
+    "ALL_PROXY",
+    "all_proxy",
+    "HTTPS_PROXY",
+    "https_proxy",
+    "HTTP_PROXY",
+    "http_proxy",
+)
+
+
+def _normalize_proxy_url_scheme(url: str) -> str:
+    text = (url or "").strip()
+    if text.lower().startswith("socks://"):
+        # httpx/openai expects socks5://, not socks://.
+        return f"socks5://{text[len('socks://'):]}"
+    return text
+
+
+def _normalize_proxy_env_inplace() -> None:
+    for key in _PROXY_ENV_KEYS:
+        value = os.environ.get(key)
+        if not value:
+            continue
+        normalized = _normalize_proxy_url_scheme(value)
+        if normalized != value:
+            os.environ[key] = normalized
+            logger.info("Normalized proxy env %s from socks:// to socks5://", key)
 
 
 def _sanitize_debug_payload(value: Any) -> Any:
@@ -95,6 +125,8 @@ class OpenAICompatibleChatLLMService(LLMService):
         if self._client is not None:
             return self._client
         from openai import AsyncOpenAI  # type: ignore
+
+        _normalize_proxy_env_inplace()
 
         self._client = AsyncOpenAI(
             base_url=self._cfg.base_url,
