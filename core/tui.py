@@ -203,6 +203,13 @@ def _open_path_in_browser(path: str | Path) -> bool:
     except Exception:
         return False
 
+
+def _normalize_clipboard_text(text: str) -> str:
+    """Normalize line endings to LF to keep TextArea undo locations consistent."""
+    if not text:
+        return text
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
 class FileViewer(ModalScreen):
     """Screen to display file content."""
     
@@ -647,7 +654,7 @@ class ChatInput(TextArea):
                 ["pbpaste"], capture_output=True, text=True, timeout=3
             )
             if result.returncode == 0 and result.stdout:
-                clipboard = result.stdout
+                clipboard = _normalize_clipboard_text(result.stdout)
         except Exception:
             pass
         if clipboard:
@@ -655,6 +662,40 @@ class ChatInput(TextArea):
             if res := self._replace_via_keyboard(clipboard, start, end):
                 self.move_cursor(res.end_location)
                 self._refresh_attachment_suggestions()
+
+    def _reset_after_history_failure(self) -> None:
+        """Best-effort recovery for rare Textual undo/redo cursor desync errors."""
+        try:
+            self.text = _normalize_clipboard_text(self.text)
+        except Exception:
+            pass
+
+        history = getattr(self, "history", None)
+        if history is not None:
+            clear = getattr(history, "clear", None)
+            if callable(clear):
+                try:
+                    clear()
+                except Exception:
+                    pass
+
+        try:
+            self.move_cursor(self.document.end)
+        except Exception:
+            pass
+        self._refresh_attachment_suggestions()
+
+    def action_undo(self) -> None:
+        try:
+            super().action_undo()
+        except ValueError:
+            self._reset_after_history_failure()
+
+    def action_redo(self) -> None:
+        try:
+            super().action_redo()
+        except ValueError:
+            self._reset_after_history_failure()
 
     async def _on_key(self, event: events.Key) -> None:
         if event.key == "enter":
@@ -718,7 +759,7 @@ class TerminalInput(Input):
                 ["pbpaste"], capture_output=True, text=True, timeout=3
             )
             if result.returncode == 0 and result.stdout:
-                clipboard = result.stdout.strip()
+                clipboard = _normalize_clipboard_text(result.stdout).strip()
         except Exception:
             pass
         if clipboard:
