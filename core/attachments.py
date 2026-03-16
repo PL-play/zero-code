@@ -191,7 +191,9 @@ def get_attachment_suggestions(raw_path: str, limit: int = ATTACHMENT_SUGGESTION
             seen.add(value)
             candidates.append((rank, {"value": value, "kind": kind, "label": _build_suggestion_label(entry, value, kind)}))
 
-    allow_global_fallback = not explicit_directory_query and not (has_scoped_directory_query and resolved_scoped_directory)
+    # Only fallback to global index when the scoped directory cannot be resolved.
+    # This keeps bare '@' focused on the current directory instead of mixing nested files.
+    allow_global_fallback = not explicit_directory_query and not resolved_scoped_directory
     if len(candidates) < limit and allow_global_fallback:
         for value, kind in _global_attachment_index():
             if value in seen:
@@ -206,7 +208,11 @@ def get_attachment_suggestions(raw_path: str, limit: int = ATTACHMENT_SUGGESTION
             entry_path = Path(value[:-1] if kind == "dir" else value)
             candidates.append((rank, {"value": value, "kind": kind, "label": _build_suggestion_label(entry_path, value, kind)}))
 
-    candidates.sort(key=lambda item: (item[0][0], item[0][1], item[1]["kind"] != "dir", item[0][2]))
+    # For bare '@' queries, prioritize files so they are not hidden behind many directories.
+    if not prefix:
+        candidates.sort(key=lambda item: (item[1]["kind"] == "dir", item[0][2].lower()))
+    else:
+        candidates.sort(key=lambda item: (item[0][0], item[0][1], item[1]["kind"] != "dir", item[0][2]))
     return [item[1] for item in candidates[:limit]]
 
 

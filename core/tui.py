@@ -517,8 +517,9 @@ class FileViewer(ModalScreen):
 class ChatInput(TextArea):
     """A multi-line text area that submits on Enter and allows newlines with Shift+Enter or Ctrl+J."""
 
-    ATTACHMENT_SUGGESTION_FETCH_LIMIT = 64
-    ATTACHMENT_PREVIEW_WINDOW = 8
+    ATTACHMENT_SUGGESTION_FETCH_LIMIT = 256
+    # Keep header + items + footer within #attachment_preview max-height (8).
+    ATTACHMENT_PREVIEW_WINDOW = 5
     
     BINDINGS = [
         Binding("ctrl+j", "newline", "New Line", show=False),
