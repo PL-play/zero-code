@@ -264,9 +264,7 @@ def _resolve_attachment_file(raw_path: str) -> Path | None:
         resolved = safe_path(raw_path)
     except Exception:
         return None
-    if not resolved.is_file():
-        return None
-    return resolved
+    return resolved if resolved.is_file() else None
 
 
 def _find_attachment_token_bounds(text: str, start_index: int) -> tuple[int, str] | None:
@@ -325,6 +323,22 @@ def build_user_message(query: str) -> tuple[dict[str, Any], list[str]]:
 
         resolved = _resolve_attachment_file(raw_path)
         if resolved is None:
+            # 1) 如果是一个目录：不当作“附件”，但仍把它注入为**字面路径**，而不是保留原始的 @token。
+            try:
+                candidate = safe_path(raw_path)
+                if candidate.is_dir():
+                    display = _display_path(candidate)
+                    cleaned_parts.append(f"`{display}`")
+                    cursor = end
+                    # 目录本身不会作为多模态附件上传，只在提示词中以字面路径存在。
+                    continue
+            except Exception as exc:
+                warnings.append(f"Skipping attachment `{raw_path}`: {exc}")
+                cleaned_parts.append(query[start:end])
+                cursor = end
+                continue
+
+            # 2) 既不是文件也不是目录：按原逻辑处理，保留原文并给出 warning。
             try:
                 safe_path(raw_path)
                 warnings.append(f"Skipping attachment `{raw_path}`: not a file")
