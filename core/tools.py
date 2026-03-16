@@ -279,7 +279,10 @@ def run_generate_image(
             filename_prefix=filename_prefix,
             workspace_root=WORKSPACE_DIR,
         )
-        return _tool_json(summarize_image_operation_result(result, operation="generate_image"))
+        summary = summarize_image_operation_result(result, operation="generate_image")
+        summary["workspace"] = str(WORKSPACE_DIR)
+        summary["note"] = "All paths are relative to workspace directory. Use these relative paths directly with read_file or other tools."
+        return _tool_json(summary)
     except Exception as e:
         return _tool_json(summarize_image_operation_error(e, operation="generate_image"))
 
@@ -323,13 +326,14 @@ def run_edit_image(
             filename_prefix=filename_prefix,
             workspace_root=WORKSPACE_DIR,
         )
-        return _tool_json(
-            summarize_image_operation_result(
-                result,
-                operation="edit_image",
-                input_paths=[path.as_posix() for path in resolved_image_paths],
-            )
+        summary = summarize_image_operation_result(
+            result,
+            operation="edit_image",
+            input_paths=[path.as_posix() for path in resolved_image_paths],
         )
+        summary["workspace"] = str(WORKSPACE_DIR)
+        summary["note"] = "All paths are relative to workspace directory. Use these relative paths directly with read_file or other tools."
+        return _tool_json(summary)
     except Exception as e:
         return _tool_json(
             summarize_image_operation_error(
@@ -514,9 +518,10 @@ def run_write(path: str, content: str) -> str:
         old_size = fp.stat().st_size if existed else 0
         fp.write_text(content)
         line_count = content.count("\n") + (1 if content and not content.endswith("\n") else 0)
+        display = _display_path(fp)
         if existed:
-            return f"Wrote {len(content)} bytes ({line_count} lines) to {path} (overwritten, was {old_size} bytes)"
-        return f"Wrote {len(content)} bytes ({line_count} lines) to {path} (new file)"
+            return f"Wrote {len(content)} bytes ({line_count} lines) to {display} (overwritten, was {old_size} bytes) [workspace: {WORKSPACE_DIR}]"
+        return f"Wrote {len(content)} bytes ({line_count} lines) to {display} (new file) [workspace: {WORKSPACE_DIR}]"
     except Exception as e:
         return f"Error: {e}"
 
@@ -827,8 +832,9 @@ def run_glob(pattern: str, path: str = ".") -> str:
             pattern = "**/" + pattern
         matches = sorted(base.glob(pattern), key=lambda p: p.stat().st_mtime, reverse=True)
         if not matches:
-            return f"No files matching '{pattern}' in {path}"
-        lines = [_display_path(m) for m in matches[:50]]
+            return f"No files matching '{pattern}' in {_display_path(base)} [workspace: {WORKSPACE_DIR}]"
+        header = f"[searched in: {_display_path(base)}, workspace: {WORKSPACE_DIR}]"
+        lines = [header] + [_display_path(m) for m in matches[:50]]
         result = "\n".join(lines)
         if len(matches) > 50:
             result += f"\n... and {len(matches) - 50} more"

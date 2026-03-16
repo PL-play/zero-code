@@ -8,9 +8,11 @@ from llm_client.llm_factory import OpenAICompatibleChatLLMService
 from llm_client.qwen_image import qwen_image_config_from_env, qwen_image_edit_config_from_env
 from llm_client.web_search import web_search_config_from_env
 
-load_dotenv(override=True)
-
 AGENT_DIR = Path(__file__).resolve().parent.parent
+
+# Always load .env from agent home, regardless of CWD.
+_env_path = AGENT_DIR / ".env"
+load_dotenv(_env_path, override=True)
 WORKSPACE_ENV_KEYS = ("ZERO_CODE_WORKSPACE", "ZERO_CODE_WORKDIR", "VSCODE_WORKSPACE_FOLDER")
 
 
@@ -26,6 +28,15 @@ WORKSPACE_DIR = _resolve_workspace_dir()
 # Backward-compatible alias used by older modules/tests.
 WORKDIR = WORKSPACE_DIR
 DEFAULT_SKILLS_DIR = AGENT_DIR / ".skills"
+
+if WORKSPACE_DIR == AGENT_DIR:
+    import sys
+    print(
+        f"⚠ WARNING: Workspace and agent home are the same directory: {WORKSPACE_DIR}\n"
+        "  This means file operations will target the agent's own code.\n"
+        "  Set ZERO_CODE_WORKSPACE to a different directory, or run from a project directory.",
+        file=sys.stderr,
+    )
 
 
 def _resolve_skills_dir() -> Path:
@@ -48,6 +59,7 @@ SKILLS_DIR = _resolve_skills_dir()
 AGENT_RW_ALLOWLIST = (
     AGENT_DIR / ".cache",
     AGENT_DIR / "logs",
+    SKILLS_DIR,
 )
 
 MODEL = os.environ["OPENAI_COMPAT_MODEL"]
@@ -98,10 +110,24 @@ def safe_path(p: str, purpose: str = "rw") -> Path:
     if candidate.is_relative_to(AGENT_DIR):
         if _is_in_agent_rw_allowlist(candidate):
             return candidate
+        # Try to suggest the workspace-relative equivalent
+        try:
+            rel_to_agent = candidate.relative_to(AGENT_DIR)
+            workspace_alt = WORKSPACE_DIR / rel_to_agent
+            hint = (
+                f" Did you mean the workspace file instead? "
+                f"Try: {rel_to_agent} (resolves to {workspace_alt})"
+            )
+        except ValueError:
+            hint = ""
         raise ValueError(
-            "Access to agent home is restricted. Only allowlisted paths are permitted: "
-            + ", ".join(str(p) for p in AGENT_RW_ALLOWLIST)
+            f"Access to agent home is restricted.{hint} "
+            f"Workspace is at {WORKSPACE_DIR}, not {AGENT_DIR}. "
+            "Use relative paths (they default to workspace) or @workspace/<path>."
         )
 
-    raise ValueError(f"Path escapes allowed directories: {p}")
+    raise ValueError(
+        f"Path escapes allowed directories: {p}. "
+        f"Workspace: {WORKSPACE_DIR}. Use relative paths or @workspace/<path>."
+    )
 

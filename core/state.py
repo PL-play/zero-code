@@ -495,13 +495,14 @@ class SkillLoader:
             f"<skill name=\"{name}\" path=\"{skill['path']}\">\n"
             f"Source: {skill['path']}\n\n"
             "[Execution Context]\n"
-            f"- Agent home: {AGENT_DIR}\n"
-            f"- Workspace root: {WORKSPACE_DIR}\n"
-            f"- Skill root: {skill_root}\n"
+            f"- Workspace (user's project, default for file ops): {WORKSPACE_DIR}\n"
+            f"- Agent home (zero-code installation): {AGENT_DIR}\n"
+            f"- Skill root (this skill's scripts/assets): {skill_root}\n"
             "- Rules:\n"
             "  1) For relative commands in this skill (for example `python scripts/cli.py ...`), run from Skill root.\n"
             f"  2) Prefer absolute command form: `python {skill_root}/scripts/cli.py ...` when applicable.\n"
-            "  3) Do NOT search outside workspace/skill root unless user explicitly asks.\n\n"
+            "  3) Output files from skill execution should go to WORKSPACE, not skill root or agent home.\n"
+            "  4) Do NOT search outside workspace/skill root unless user explicitly asks.\n\n"
             f"{skill['body']}\n"
             f"</skill>"
         )
@@ -760,7 +761,10 @@ class ContextManager:
                 "3) Key technical decisions made and why\n"
                 "4) Open tasks and next steps\n"
                 "5) Errors encountered and how they were resolved\n"
-                "6) Files touched and why they matter\n"
+                "6) Files touched and why they matter — use workspace-relative paths\n"
+                "7) IMPORTANT: Preserve all file paths mentioned. Note that workspace is "
+                f"{WORKSPACE_DIR} and agent home is {AGENT_DIR}. "
+                "All user project files are in workspace.\n"
                 f"{focus_instruction}"
                 "Be concise but preserve critical details needed to continue without re-asking.\n\n"
                 + conversation_text
@@ -785,6 +789,13 @@ class ContextManager:
             "This session is being continued from a previous conversation that ran out of context.",
             f"Transcript saved to: {transcript_path.relative_to(AGENT_DIR)}",
             "",
+            "<path_reminder>",
+            f"WORKSPACE (your working directory): {WORKSPACE_DIR}",
+            f"AGENT HOME (zero-code installation): {AGENT_DIR}",
+            f"SKILLS: {SKILLS_DIR}",
+            "All relative file paths resolve to WORKSPACE. Files you created earlier in this session are in WORKSPACE.",
+            "</path_reminder>",
+            "",
             summary,
         ]
 
@@ -793,7 +804,7 @@ class ContextManager:
             parts.append(f"\n<current_todos>\n{todo_state}\n</current_todos>")
 
         if self.recent_files:
-            parts.append(f"\nRecently accessed files: {', '.join(self.recent_files)}")
+            parts.append(f"\nRecently accessed files (workspace-relative): {', '.join(self.recent_files)}")
 
         parts.append("\nPlease continue from where we left off without asking the user any further questions.")
 

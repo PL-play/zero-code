@@ -1046,6 +1046,7 @@ class ZeroCodeApp(App):
         Binding("ctrl+y", "copy_last_reply", "Copy Reply", show=True),
         Binding("ctrl+g", "open_mermaid", "Open Mermaid", show=True),
         Binding("ctrl+o", "open_last_image", "Open Image", show=True),
+        Binding("ctrl+m", "toggle_raw_reply", "Raw/MD", show=True),
     ]
 
     def __init__(self, *args, **kwargs):
@@ -1100,6 +1101,7 @@ class ZeroCodeApp(App):
         self._pending_mermaid_blocks: list[str] = []
         self._pending_image_paths: list[str] = []
         self._terminal_bash = None  # lazy-init BashSession for Terminal tab
+        self._raw_reply_visible = False
 
     def _cancel_timer(self, timer_obj):
         if timer_obj is None:
@@ -1331,10 +1333,9 @@ Type your request below to get started. Use `/help` for commands.
         def _add_chat():
             chat = self.query_one("#chat_history", VerticalScroll)
             now = datetime.now().strftime("%H:%M:%S")
-            
-            # Wrap duration string if it exists
+
             dur_str = f"\n\n*(Took {duration:.2f}s)*" if duration is not None else ""
-            
+
             if role == "user":
                 wrapper = Container(Markdown(f"**user [{now}]>**\n{markdown_text}"), classes="chat-user")
                 wrapper.styles.padding = (0, 1)
@@ -1349,11 +1350,11 @@ Type your request below to get started. Use `/help` for commands.
             elif role == "tool":
                 wrapper = Container(Markdown(f"**tool [{now}]>**\n{markdown_text}"), classes="chat-agent")
             else:
-                wrapper = Container(Markdown(f"**agent [{now}]>**\n{markdown_text}{dur_str}"), classes="chat-agent")
+                wrapper = Container(Markdown(f"{markdown_text}{dur_str}"), classes="chat-agent")
 
             chat.mount(wrapper)
             chat.scroll_end(animate=False)
-            
+
         if self._thread_id == threading.get_ident():
             _add_chat()
         else:
@@ -1454,6 +1455,37 @@ Type your request below to get started. Use `/help` for commands.
             self.notify("Copied to clipboard ✓", timeout=2)
         except Exception as e:
             self.notify(f"Copy failed: {e}", severity="error", timeout=3)
+
+    async def action_toggle_raw_reply(self) -> None:
+        """Toggle the last agent reply between rendered Markdown and raw selectable text."""
+        text = self._last_reply_text
+        if not text:
+            self.notify("No reply to toggle", severity="warning", timeout=2)
+            return
+
+        chat = self.query_one("#chat_history", VerticalScroll)
+        # Find the last .chat-agent container
+        agents = list(chat.query(".chat-agent"))
+        if not agents:
+            self.notify("No agent reply found", severity="warning", timeout=2)
+            return
+        last_wrapper = agents[-1]
+
+        self._raw_reply_visible = not self._raw_reply_visible
+        await last_wrapper.remove_children()
+
+        if self._raw_reply_visible:
+            raw_area = TextArea(text, read_only=True, id="raw_reply_area")
+            raw_area.styles.height = "auto"
+            raw_area.styles.max_height = 40
+            raw_area.styles.background = "#1A1A24"
+            await last_wrapper.mount(raw_area)
+            self.notify("Raw markdown — select and copy freely. Ctrl+M to switch back.", timeout=3)
+        else:
+            await last_wrapper.mount(Markdown(text))
+            self.notify("Rendered markdown", timeout=2)
+
+        chat.scroll_end(animate=False)
 
     async def action_open_mermaid(self) -> None:
         """Open pending mermaid diagrams (from last agent reply) in browser."""

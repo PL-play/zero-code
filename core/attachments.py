@@ -343,7 +343,8 @@ def build_user_message(query: str) -> tuple[dict[str, Any], list[str]]:
             continue
 
         if attachment.get("kind") not in {"image", "pdf"}:
-            cleaned_parts.append(raw_path)
+            display = _display_path(Path(attachment["path"]))
+            cleaned_parts.append(f"`{display}`")
             cursor = end
             continue
 
