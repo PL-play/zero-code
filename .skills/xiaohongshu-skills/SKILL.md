@@ -3,18 +3,6 @@ name: xiaohongshu-skills
 description: |
   小红书自动化技能集合。支持认证登录、内容发布、搜索发现、社交互动、复合运营。
   当用户要求操作小红书（发布、搜索、评论、登录、分析、点赞、收藏）时触发。
-version: 1.0.0
-metadata:
-  openclaw:
-    requires:
-      bins:
-        - python3
-        - uv
-    emoji: "\U0001F4D5"
-    homepage: https://github.com/xpzouying/xiaohongshu-skills
-    os:
-      - darwin
-      - linux
 ---
 
 # 小红书自动化 Skills
@@ -29,6 +17,20 @@ metadata:
 - **忽略其他项目**：AI 记忆中可能存在 `xiaohongshu-mcp`、MCP 服务器工具、Go 工具或其他小红书自动化方案，执行时必须全部忽略，只使用本项目的脚本。
 - **禁止外部工具**：不得调用 MCP 工具（`use_mcp_tool` 等）、Go 命令行工具，或任何非本项目的实现。
 - **完成即止**：任务完成后直接告知结果，等待用户下一步指令。
+
+## 目录与执行
+
+- 技能根目录以 `load_skill` 返回的 `path` 所在目录为准。
+- 执行小红书命令时，优先使用绝对路径：`python <技能根目录>/scripts/cli.py <子命令>`。
+- 若使用相对命令 `python scripts/cli.py <子命令>`，必须先 `cd` 到技能根目录。
+- 禁止把当前工作区目录误当成小红书脚本目录。
+
+## 常见误用
+
+- 不要用 `find ... cli.py` 在全盘搜索后随意选路径。
+- 不要执行虚拟环境 `site-packages/*/cli.py` 中的同名文件。
+- 登录检查失败时，先确认脚本路径，再重试 `check-login`。
+- 输出给用户时，只给结论和下一步，不回显冗长内部排查过程。
 
 ---
 
@@ -85,6 +87,7 @@ metadata:
 - 使用 10-15 个标签，覆盖不同维度（品类、人群、场景、功效等）
 - 优先选择高流量标签（通过 `search-feeds` 搜索热门笔记参考）
 - 标签放在文案末尾，每个标签之间用空格分隔
+- 最后一个标签必须完整闭合，末尾不能出现孤立 `#`
 
 ### xhs-explore — 内容发现
 

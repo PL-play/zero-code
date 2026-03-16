@@ -9,11 +9,12 @@ Only keeps:
 
 from core.agent import agent_loop
 from core.commands import COMMAND_DISPATCH, SLASH_COMMANDS, _handle_help
-from core.runtime import AGENT_DIR, MODEL, SKILLS_DIR, WORKDIR, client
+from core.runtime import AGENT_DIR, MODEL, SKILLS_DIR, WORKDIR, WORKSPACE_DIR, client
 from core.state import UI
 from core.tui import ZeroCodeApp
 
 __all__ = [
+    "WORKSPACE_DIR",
     "WORKDIR",
     "AGENT_DIR",
     "SKILLS_DIR",

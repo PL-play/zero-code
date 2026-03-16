@@ -23,7 +23,7 @@ from core.attachments import (
     get_attachment_suggestions,
     message_preview_text,
 )
-from core.runtime import WORKDIR, AGENT_DIR, MODEL
+from core.runtime import WORKSPACE_DIR, MODEL
 import tempfile
 import webbrowser
 from rich.segment import Segment
@@ -254,8 +254,8 @@ class FileViewer(ModalScreen):
     def on_mount(self):
         title = self.query_one("#file_viewer_title", Label)
         try:
-            # show relative path from WORKDIR
-            rel_path = self.filepath.relative_to(WORKDIR)
+            # show relative path from workspace directory
+            rel_path = self.filepath.relative_to(WORKSPACE_DIR)
             title.update(f"📄 {rel_path}")
         except ValueError:
             title.update(f"📄 {self.filepath.absolute()}")
@@ -505,7 +505,7 @@ class FileViewer(ModalScreen):
             self.app.notify("No mermaid diagrams found in this file.", severity="warning", timeout=3)
             return
         try:
-            rel = self.filepath.relative_to(WORKDIR)
+            rel = self.filepath.relative_to(WORKSPACE_DIR)
         except ValueError:
             rel = self.filepath.name
         path = _open_mermaid_in_browser(blocks, title=f"Mermaid — {rel}")
@@ -1056,6 +1056,8 @@ class ZeroCodeApp(App):
         self._stream_pending_buffer = ""
         self._stream_wrapper: Container | None = None
         self._stream_text_widget: Static | None = None
+        self._stream_in_think_block = False
+        self._stream_think_tag_buffer = ""
         self._stream_turn_started_at = 0.0
         self._stream_last_flush_ts = 0.0
         try:
@@ -1122,7 +1124,7 @@ class ZeroCodeApp(App):
             with Vertical(id="right_pane"):
                 with TabbedContent(initial="tab-logs"):
                     with TabPane("Explorer", id="tab-explorer"):
-                        yield DirectoryTree(str(WORKDIR), id="explorer_tree")
+                        yield DirectoryTree(str(WORKSPACE_DIR), id="explorer_tree")
                     with TabPane("Agent Logs", id="tab-logs"):
                         # Re-enable Textual wrapping so Rich Tables respect exactly the remaining log width
                         yield SelectableRichLog(id="agent_logs", wrap=True, highlight=True, markup=True, auto_scroll=True)
@@ -1142,7 +1144,7 @@ class ZeroCodeApp(App):
             Label("Idle", id="run_status", classes="status-dim"),
             Label(f" {MODEL} "),
             Label("", id="git_branch", classes="status-highlight"),
-            Label(f" {WORKDIR.name} ", classes="status-dim"),
+            Label(f" {WORKSPACE_DIR.name} ", classes="status-dim"),
             Static("", id="status_spacer"),
             Label("tab agents  ctrl+p commands", classes="status-dim"),
             Label(" ○ ZeroCode 1.0 ", classes="status-highlight"),
@@ -1168,9 +1170,9 @@ Type your request below to get started. Use `/help` for commands.
 
         self.system_log("ZeroCodeApp mounted")
         self.system_log(f"Model: {MODEL}")
-        self.system_log(f"Workdir: {WORKDIR}")
+        self.system_log(f"Workspace: {WORKSPACE_DIR}")
         
-        self.agent_log(f"Initialized agent at {WORKDIR}")
+        self.agent_log(f"Initialized agent at {WORKSPACE_DIR}")
         self.set_interval(0.12, self._tick_run_status)
         self.set_interval(10, self._periodic_git_refresh)
         self._refresh_git_info()
@@ -1278,7 +1280,7 @@ Type your request below to get started. Use `/help` for commands.
     def _refresh_git_info(self):
         try:
             branch_result = subprocess.run(
-                ["git", "-C", str(WORKDIR), "branch", "--show-current"],
+                ["git", "-C", str(WORKSPACE_DIR), "branch", "--show-current"],
                 capture_output=True, text=True, timeout=3,
             )
             branch = branch_result.stdout.strip() if branch_result.returncode == 0 else ""
@@ -1286,7 +1288,7 @@ Type your request below to get started. Use `/help` for commands.
             dirty_count = 0
             if branch:
                 status_result = subprocess.run(
-                    ["git", "-C", str(WORKDIR), "status", "--porcelain"],
+                    ["git", "-C", str(WORKSPACE_DIR), "status", "--porcelain"],
                     capture_output=True, text=True, timeout=3,
                 )
                 if status_result.returncode == 0:
@@ -1504,12 +1506,64 @@ Type your request below to get started. Use `/help` for commands.
         self._stream_pending_buffer = ""
         self._stream_wrapper = None
         self._stream_text_widget = None
+        self._stream_in_think_block = False
+        self._stream_think_tag_buffer = ""
         self._stream_last_flush_ts = time.monotonic()
         try:
             self.query_one("#think_live", Static).update("")
         except Exception:
             pass
         self._set_think_visible(False)
+
+    @staticmethod
+    def _split_partial_tag_suffix(text: str, tag: str) -> tuple[str, str]:
+        max_prefix = min(len(text), len(tag) - 1)
+        for size in range(max_prefix, 0, -1):
+            suffix = text[-size:]
+            if tag.startswith(suffix):
+                return text[:-size], suffix
+        return text, ""
+
+    def _route_stream_chunk(self, chunk: str) -> str:
+        if not chunk:
+            return ""
+
+        data = self._stream_think_tag_buffer + chunk
+        self._stream_think_tag_buffer = ""
+        out_parts: list[str] = []
+        i = 0
+
+        while i < len(data):
+            if self._stream_in_think_block:
+                end = data.find("</think>", i)
+                if end < 0:
+                    think_text, suffix = self._split_partial_tag_suffix(data[i:], "</think>")
+                    if think_text:
+                        self.append_stream_think(think_text)
+                    self._stream_think_tag_buffer = suffix
+                    return "".join(out_parts)
+
+                think_text = data[i:end]
+                if think_text:
+                    self.append_stream_think(think_text)
+                self._stream_in_think_block = False
+                i = end + len("</think>")
+                continue
+
+            start = data.find("<think>", i)
+            if start < 0:
+                visible, suffix = self._split_partial_tag_suffix(data[i:], "<think>")
+                if visible:
+                    out_parts.append(visible)
+                self._stream_think_tag_buffer = suffix
+                break
+
+            if start > i:
+                out_parts.append(data[i:start])
+            self._stream_in_think_block = True
+            i = start + len("<think>")
+
+        return "".join(out_parts)
 
     def _flush_stream_pending(self):
         if not self._stream_pending_buffer:
@@ -1529,7 +1583,9 @@ Type your request below to get started. Use `/help` for commands.
     def append_stream_text(self, text: str):
         if not text or not text.strip():
             return
-        normalized = text.replace("\r", "")
+        normalized = self._route_stream_chunk(text.replace("\r", ""))
+        if not normalized or not normalized.strip():
+            return
         if not self._stream_text_buffer and not self._stream_pending_buffer:
             normalized = normalized.lstrip("\n")
         normalized = re.sub(r"\n[ \t]+\n", "\n\n", normalized)
@@ -1609,6 +1665,8 @@ Type your request below to get started. Use `/help` for commands.
             self._set_think_visible(False)
         self._stream_wrapper = None
         self._stream_text_widget = None
+        self._stream_in_think_block = False
+        self._stream_think_tag_buffer = ""
         self._stream_text_buffer = ""
         self._stream_pending_buffer = ""
 
@@ -1670,6 +1728,8 @@ Type your request below to get started. Use `/help` for commands.
         # reset stream state
         self._stream_wrapper = None
         self._stream_text_widget = None
+        self._stream_in_think_block = False
+        self._stream_think_tag_buffer = ""
         self._stream_text_buffer = ""
         self._stream_pending_buffer = ""
 
@@ -1786,7 +1846,7 @@ Type your request below to get started. Use `/help` for commands.
         # Lazy-init a dedicated BashSession for Terminal tab
         if self._terminal_bash is None:
             from core.tools import BashSession
-            self._terminal_bash = BashSession(WORKDIR)
+            self._terminal_bash = BashSession(WORKSPACE_DIR)
 
         bash = self._terminal_bash
 

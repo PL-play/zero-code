@@ -136,13 +136,13 @@ Review src/api/ 下所有接口，检查安全和性能隐患
 /skills          # 查看已加载技能
 ```
 
-Agent 通过 `load_skill(name)` 工具加载技能。技能以 `.skills/<name>/SKILL.md` 形式存放，使用 YAML frontmatter 定义元数据。
+Agent 通过 `load_skill(name)` 工具加载技能。默认技能目录为 `<agent_home>/.skills`，可通过 `ZERO_CODE_SKILLS_DIR` 配置；若未配置或配置目录不存在，会自动回退到 `<agent_home>/.skills`。技能文件格式为 `<skills_dir>/<name>/SKILL.md`，使用 YAML frontmatter 定义元数据。
 
 <details>
 <summary>创建自定义技能</summary>
 
-```
-.skills/my-skill/SKILL.md
+```text
+<skills_dir>/my-skill/SKILL.md
 ```
 
 ````markdown
@@ -226,6 +226,7 @@ Agent 通过 load_skill("my-skill") 加载后会获得这些知识。
 | `DASHSCOPE_IMAGE_EDIT_WATERMARK` | `false` | 是否默认添加水印 |
 | `DASHSCOPE_IMAGE_EDIT_USE_PROXY` | `false` | 是否为图像编辑请求显式启用系统/环境代理。默认关闭，避免本地代理导致证书校验失败 |
 | `CONTEXT_COMPACT_THRESHOLD` | `50000` | 自动压缩阈值（token） |
+| `ZERO_CODE_SKILLS_DIR` | `<agent_home>/.skills` | 自定义技能目录（相对路径按 agent_home 解析）。未配置或目录不存在时自动回退默认值 |
 | `STREAM_FLUSH_MIN_INTERVAL_S` | `0.08` | 流式刷新最小间隔（秒） |
 | `STREAM_FLUSH_MIN_CHARS` | `24` | 缓冲区刷新字符数 |
 | `THINK_PANEL_HIDE_DELAY_S` | `1.8` | 思考面板消失延迟 |
@@ -256,7 +257,7 @@ zero-code/
 │   ├── llm_factory.py      # OpenAI 兼容客户端（流式 & 非流式）
 │   ├── llm_tooling.py      # 工具注册 & Schema 生成
 │   └── llm_utils.py        # JSON 提取等工具函数
-├── .skills/                # 技能目录
+├── .skills/                # 默认技能目录（可通过 ZERO_CODE_SKILLS_DIR 覆盖）
 ├── docs/                   # 设计文档
 └── tests/                  # 测试
 ```

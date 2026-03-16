@@ -15,9 +15,18 @@ from rich.table import Table
 from rich.text import Text
 from llm_client.interface import LLMRequest
 
-from core.runtime import AGENT_DIR, MODEL, SKILLS_DIR, WORKDIR, client
+from core.runtime import AGENT_DIR, MODEL, SKILLS_DIR, WORKSPACE_DIR, client
 
 TOOL_MAX_LINES = 20
+
+
+def _format_path_for_ui(path: Path) -> str:
+    resolved = path.resolve()
+    if resolved.is_relative_to(WORKSPACE_DIR):
+        return str(resolved.relative_to(WORKSPACE_DIR))
+    if resolved.is_relative_to(AGENT_DIR):
+        return f"@agent/{resolved.relative_to(AGENT_DIR)}"
+    return str(path)
 
 
 class TUIAdapter:
@@ -68,8 +77,8 @@ class TUIAdapter:
                 return "?"
             try:
                 raw = Path(p)
-                resolved = raw.resolve() if raw.is_absolute() else (WORKDIR / raw).resolve()
-                return str(resolved.relative_to(WORKDIR))
+                resolved = raw.resolve() if raw.is_absolute() else (WORKSPACE_DIR / raw).resolve()
+                return _format_path_for_ui(resolved)
             except Exception:
                 return p
 
@@ -93,7 +102,7 @@ class TUIAdapter:
             return f"grep: {pattern}"
         if name == "bash":
             command = str(tool_input.get("command") or "").strip().replace("\n", " ")
-            workdir_str = str(WORKDIR)
+            workdir_str = str(WORKSPACE_DIR)
             if workdir_str in command:
                 command = command.replace(workdir_str + "/", "")
                 command = command.replace(workdir_str, ".")
@@ -183,8 +192,8 @@ class TUIAdapter:
             return
         try:
             p = Path(raw_path)
-            resolved = p.resolve() if p.is_absolute() else (WORKDIR / p).resolve()
-            rel = str(resolved.relative_to(WORKDIR))
+            resolved = p.resolve() if p.is_absolute() else (WORKSPACE_DIR / p).resolve()
+            rel = _format_path_for_ui(resolved)
         except Exception:
             rel = raw_path
 
@@ -212,8 +221,8 @@ class TUIAdapter:
             return
         try:
             p = Path(raw_path)
-            resolved = p.resolve() if p.is_absolute() else (WORKDIR / p).resolve()
-            rel = str(resolved.relative_to(WORKDIR))
+            resolved = p.resolve() if p.is_absolute() else (WORKSPACE_DIR / p).resolve()
+            rel = _format_path_for_ui(resolved)
         except Exception:
             rel = raw_path
 
@@ -230,10 +239,12 @@ class TUIAdapter:
         self._safe_dispatch("refresh_git_info")
 
     def _get_git_file_status(self, rel_path: str) -> str:
+        if rel_path.startswith("@agent/"):
+            return " "
         try:
             import subprocess
             r = subprocess.run(
-                ["git", "-C", str(WORKDIR), "status", "--porcelain", "--", rel_path],
+                ["git", "-C", str(WORKSPACE_DIR), "status", "--porcelain", "--", rel_path],
                 capture_output=True, text=True, timeout=3,
             )
             if r.returncode == 0 and r.stdout.strip():
@@ -478,9 +489,19 @@ class SkillLoader:
         skill = self.skills.get(name)
         if not skill:
             return f"Error: Unknown skill '{name}'. Available: {', '.join(self.skills.keys())}"
+        skill_path = Path(skill["path"]).resolve()
+        skill_root = skill_path.parent
         return (
             f"<skill name=\"{name}\" path=\"{skill['path']}\">\n"
             f"Source: {skill['path']}\n\n"
+            "[Execution Context]\n"
+            f"- Agent home: {AGENT_DIR}\n"
+            f"- Workspace root: {WORKSPACE_DIR}\n"
+            f"- Skill root: {skill_root}\n"
+            "- Rules:\n"
+            "  1) For relative commands in this skill (for example `python scripts/cli.py ...`), run from Skill root.\n"
+            f"  2) Prefer absolute command form: `python {skill_root}/scripts/cli.py ...` when applicable.\n"
+            "  3) Do NOT search outside workspace/skill root unless user explicitly asks.\n\n"
             f"{skill['body']}\n"
             f"</skill>"
         )
