@@ -7,7 +7,7 @@ import threading
 import uuid
 from pathlib import Path
 
-from core.runtime import IMAGE_EDIT_CONFIG, IMAGE_GENERATION_CONFIG, WEB_SEARCH_CONFIG, WORKDIR, safe_path
+from core.runtime import AGENT_DIR, AGENT_RW_ALLOWLIST, IMAGE_EDIT_CONFIG, IMAGE_GENERATION_CONFIG, WEB_SEARCH_CONFIG, WORKSPACE_DIR, safe_path
 from core.state import SKILL_LOADER, TODO
 from llm_client.qwen_image import (
     QwenImageError,
@@ -118,7 +118,16 @@ class BashSession:
         return "Bash session restarted."
 
 
-BASH = BashSession(WORKDIR)
+def _display_path(path: Path) -> str:
+    resolved = path.resolve()
+    if resolved.is_relative_to(WORKSPACE_DIR):
+        return str(resolved.relative_to(WORKSPACE_DIR))
+    if resolved.is_relative_to(AGENT_DIR):
+        return f"@agent/{resolved.relative_to(AGENT_DIR)}"
+    return str(resolved)
+
+
+BASH = BashSession(WORKSPACE_DIR)
 
 
 class BackgroundManager:
@@ -133,6 +142,10 @@ class BackgroundManager:
         if any(d in command for d in dangerous):
             return "Error: Dangerous command blocked"
 
+        scope_err = _validate_bash_command_scope(command)
+        if scope_err:
+            return scope_err
+
         task_id = str(uuid.uuid4())[:8]
         self.tasks[task_id] = {"status": "running", "result": None, "command": command}
         thread = threading.Thread(target=self._execute, args=(task_id, command), daemon=True)
@@ -144,7 +157,7 @@ class BackgroundManager:
             r = subprocess.run(
                 command,
                 shell=True,
-                cwd=WORKDIR,
+                cwd=WORKSPACE_DIR,
                 capture_output=True,
                 text=True,
                 timeout=300,
@@ -184,6 +197,55 @@ def _tool_json(data: dict[str, object]) -> str:
     return json.dumps(data, ensure_ascii=False, indent=2)
 
 
+_BASH_WRITE_HINTS = (
+    " >",
+    ">>",
+    " tee ",
+    " sed -i",
+    " rm ",
+    " mv ",
+    " cp ",
+    " touch ",
+    " mkdir ",
+)
+_BASH_READ_HINTS = (
+    " cat ",
+    " less ",
+    " head ",
+    " tail ",
+    " grep ",
+    " rg ",
+    " find ",
+)
+
+
+def _is_agent_path_allowed_for_bash(command: str) -> bool:
+    lowered = command.lower()
+    if str(AGENT_DIR).lower() not in lowered:
+        return True
+    return any(str(path).lower() in lowered for path in AGENT_RW_ALLOWLIST)
+
+
+def _validate_bash_command_scope(command: str) -> str | None:
+    lowered = f" {command.lower()} "
+    if str(AGENT_DIR).lower() not in lowered:
+        return None
+    if _is_agent_path_allowed_for_bash(command):
+        return None
+
+    if any(hint in lowered for hint in _BASH_WRITE_HINTS):
+        return (
+            "Error: Writing under agent home is blocked outside allowlisted paths (.cache/logs). "
+            "Use workspace files or allowlisted agent paths only."
+        )
+    if any(hint in lowered for hint in _BASH_READ_HINTS):
+        return (
+            "Error: Reading agent-home internals is blocked outside allowlisted paths (.cache/logs). "
+            "Use load_skill(name) for skill content instead of direct file reads."
+        )
+    return None
+
+
 def run_generate_image(
     prompt: str,
     negative_prompt: str | None = None,
@@ -215,7 +277,7 @@ def run_generate_image(
             watermark=watermark,
             output_dir=resolved_output_dir,
             filename_prefix=filename_prefix,
-            workspace_root=WORKDIR,
+            workspace_root=WORKSPACE_DIR,
         )
         return _tool_json(summarize_image_operation_result(result, operation="generate_image"))
     except Exception as e:
@@ -259,7 +321,7 @@ def run_edit_image(
             watermark=watermark,
             output_dir=resolved_output_dir,
             filename_prefix=filename_prefix,
-            workspace_root=WORKDIR,
+            workspace_root=WORKSPACE_DIR,
         )
         return _tool_json(
             summarize_image_operation_result(
@@ -403,6 +465,9 @@ def run_bash(command: str = None, restart: bool = False) -> str:
         return BASH.restart()
     if not command:
         return "Error: command is required (or set restart=true)"
+    scope_err = _validate_bash_command_scope(command)
+    if scope_err:
+        return scope_err
     return BASH.execute(command)
 
 
@@ -429,7 +494,7 @@ def run_read(path: str, offset: int = None, limit: int = None) -> str:
 
 def _list_directory(dp: Path) -> str:
     entries = sorted(dp.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
-    lines = [f"Directory: {dp.relative_to(WORKDIR)}/"]
+    lines = [f"Directory: {_display_path(dp)}/"]
     for entry in entries[:100]:
         prefix = "d " if entry.is_dir() else "f "
         size = ""
@@ -763,7 +828,7 @@ def run_glob(pattern: str, path: str = ".") -> str:
         matches = sorted(base.glob(pattern), key=lambda p: p.stat().st_mtime, reverse=True)
         if not matches:
             return f"No files matching '{pattern}' in {path}"
-        lines = [f"{m.relative_to(WORKDIR)}" for m in matches[:50]]
+        lines = [_display_path(m) for m in matches[:50]]
         result = "\n".join(lines)
         if len(matches) > 50:
             result += f"\n... and {len(matches) - 50} more"
@@ -799,7 +864,7 @@ def run_grep(pattern: str, path: str = ".", include: str = None, max_results: in
                 try:
                     for i, line in enumerate(fp.read_text().splitlines(), 1):
                         if compiled.search(line):
-                            results.append(f"{fp.relative_to(WORKDIR)}:{i}:{line.rstrip()}")
+                            results.append(f"{_display_path(fp)}:{i}:{line.rstrip()}")
                             if len(results) >= max_results:
                                 break
                 except (UnicodeDecodeError, PermissionError):
@@ -870,7 +935,7 @@ if WEB_SEARCH_CONFIG is not None:
 BASE_TOOLS = [
     {
         "name": "bash",
-        "description": "Run a shell command in a persistent bash session. State (cwd, env vars) persists across calls. Set restart=true to reset.",
+        "description": "Run a shell command in a persistent bash session rooted at workspace. State (cwd, env vars) persists across calls. Set restart=true to reset.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -881,11 +946,11 @@ BASE_TOOLS = [
     },
     {
         "name": "read_file",
-        "description": "Read file contents with line numbers, or list directory entries. Supports offset/limit for partial reads.",
+        "description": "Read file contents with line numbers, or list directory entries. Relative paths are workspace-relative; use @agent/<path> to read from agent home.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "path": {"type": "string"},
+                "path": {"type": "string", "description": "Relative path in workspace, absolute path, or explicit @workspace/<...> / @agent/<...>"},
                 "offset": {"type": "integer", "description": "Start line number (1-indexed)"},
                 "limit": {"type": "integer", "description": "Max number of lines to return"},
             },
@@ -904,7 +969,7 @@ BASE_TOOLS = [
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Workspace-relative or absolute file path to write, e.g. 'src/report.md'",
+                    "description": "Workspace-relative by default, or explicit @workspace/<...> / @agent/<...>, or absolute path",
                 },
                 "content": {
                     "type": "string",
@@ -916,7 +981,7 @@ BASE_TOOLS = [
     },
     {
         "name": "edit_file",
-        "description": "Replace exact text in a file (old_text->new_text). old_text must be unique unless replace_all=true. You MUST read_file before editing. Returns a unified diff of changes.",
+        "description": "Replace exact text in a file (old_text->new_text). Relative paths are workspace-relative by default. old_text must be unique unless replace_all=true. You MUST read_file before editing.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -946,7 +1011,7 @@ BASE_TOOLS = [
         "input_schema": {
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "File path to patch"},
+                "path": {"type": "string", "description": "File path to patch (workspace-relative by default, supports @workspace/<...> and @agent/<...>)"},
                 "patch": {"type": "string", "description": "Patch content with @@ context, -deletions, +additions"},
             },
             "required": ["path", "patch"],
@@ -954,7 +1019,7 @@ BASE_TOOLS = [
     },
     {
         "name": "glob",
-        "description": "Find files by glob pattern, sorted by modification time (newest first).",
+        "description": "Find files by glob pattern, sorted by modification time (newest first). Path defaults to workspace root.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -966,7 +1031,7 @@ BASE_TOOLS = [
     },
     {
         "name": "grep",
-        "description": "Search file contents by regex pattern. Uses ripgrep if available, else Python re fallback.",
+        "description": "Search file contents by regex pattern. Path defaults to workspace root. Uses ripgrep if available, else Python re fallback.",
         "input_schema": {
             "type": "object",
             "properties": {

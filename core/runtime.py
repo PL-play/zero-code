@@ -10,9 +10,45 @@ from llm_client.web_search import web_search_config_from_env
 
 load_dotenv(override=True)
 
-WORKDIR = Path.cwd().resolve()
 AGENT_DIR = Path(__file__).resolve().parent.parent
-SKILLS_DIR = AGENT_DIR / ".skills"
+WORKSPACE_ENV_KEYS = ("ZERO_CODE_WORKSPACE", "ZERO_CODE_WORKDIR", "VSCODE_WORKSPACE_FOLDER")
+
+
+def _resolve_workspace_dir() -> Path:
+    for key in WORKSPACE_ENV_KEYS:
+        value = (os.environ.get(key) or "").strip()
+        if value:
+            return Path(value).expanduser().resolve()
+    return Path.cwd().resolve()
+
+
+WORKSPACE_DIR = _resolve_workspace_dir()
+# Backward-compatible alias used by older modules/tests.
+WORKDIR = WORKSPACE_DIR
+DEFAULT_SKILLS_DIR = AGENT_DIR / ".skills"
+
+
+def _resolve_skills_dir() -> Path:
+    raw = (os.environ.get("ZERO_CODE_SKILLS_DIR") or "").strip()
+    if not raw:
+        return DEFAULT_SKILLS_DIR
+
+    candidate = Path(raw).expanduser()
+    if not candidate.is_absolute():
+        candidate = (AGENT_DIR / candidate).resolve()
+    else:
+        candidate = candidate.resolve()
+
+    if candidate.exists() and candidate.is_dir():
+        return candidate
+    return DEFAULT_SKILLS_DIR
+
+
+SKILLS_DIR = _resolve_skills_dir()
+AGENT_RW_ALLOWLIST = (
+    AGENT_DIR / ".cache",
+    AGENT_DIR / "logs",
+)
 
 MODEL = os.environ["OPENAI_COMPAT_MODEL"]
 
@@ -28,13 +64,44 @@ IMAGE_EDIT_CONFIG = qwen_image_edit_config_from_env(os.environ)
 WEB_SEARCH_CONFIG = web_search_config_from_env(os.environ)
 
 
-def safe_path(p: str) -> Path:
-    raw = Path(p)
-    if raw.is_absolute():
-        path = raw.resolve()
+def _is_in_agent_rw_allowlist(path: Path) -> bool:
+    resolved = path.resolve()
+    for allowed_root in AGENT_RW_ALLOWLIST:
+        try:
+            if resolved.is_relative_to(allowed_root.resolve()):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def safe_path(p: str, purpose: str = "rw") -> Path:
+    raw_input = (p or "").strip()
+    if not raw_input:
+        raise ValueError("Path is required")
+
+    # Optional explicit root selectors to disambiguate workspace vs agent home.
+    if raw_input.startswith("@workspace/"):
+        candidate = (WORKSPACE_DIR / raw_input[len("@workspace/") :]).resolve()
+    elif raw_input.startswith("@agent/"):
+        candidate = (AGENT_DIR / raw_input[len("@agent/") :]).resolve()
     else:
-        path = (WORKDIR / p).resolve()
-    if path.is_relative_to(WORKDIR) or path.is_relative_to(AGENT_DIR):
-        return path
+        raw = Path(raw_input).expanduser()
+        if raw.is_absolute():
+            candidate = raw.resolve()
+        else:
+            candidate = (WORKSPACE_DIR / raw).resolve()
+
+    if candidate.is_relative_to(WORKSPACE_DIR):
+        return candidate
+
+    if candidate.is_relative_to(AGENT_DIR):
+        if _is_in_agent_rw_allowlist(candidate):
+            return candidate
+        raise ValueError(
+            "Access to agent home is restricted. Only allowlisted paths are permitted: "
+            + ", ".join(str(p) for p in AGENT_RW_ALLOWLIST)
+        )
+
     raise ValueError(f"Path escapes allowed directories: {p}")
 

@@ -229,7 +229,7 @@ sequenceDiagram
 
 **load_skill**
 - `name`: 技能名称
-- 技能定义存储在 `.skills/` 目录下
+- 技能定义默认存储在 `<agent_home>/.skills/`，可通过 `ZERO_CODE_SKILLS_DIR` 覆盖；若配置目录不存在则回退默认目录
 
 ### 4. 上下文管理 (ContextManager)
 
@@ -258,7 +258,7 @@ flowchart LR
 ### 6. 状态追踪
 
 - **TodoManager**: 维护任务列表，支持 `pending/in_progress/completed` 状态
-- **SkillLoader**: 从 `.skills/` 目录加载技能定义
+- **SkillLoader**: 从配置的 skills 目录加载技能定义（默认 `<agent_home>/.skills/`）
 - **ContextManager**: 追踪 token 使用、文件访问、子 Agent 记录
 
 ## 关键文件
@@ -280,7 +280,7 @@ flowchart LR
 |------|------|--------|
 | `WORKDIR` | 工作目录 | 当前 cwd |
 | `AGENT_DIR` | Agent 根目录 | zero-code 项目根目录 |
-| `.skills/` | 技能定义目录 | 项目根目录下的 .skills 目录 |
+| `.skills/` | 默认技能定义目录 | 默认在 `<agent_home>/.skills`，可通过 `ZERO_CODE_SKILLS_DIR` 覆盖 |
 | `.cache/` | 缓存目录 | 项目根目录下的 .cache 目录 |
 
 ### LLM 客户端配置

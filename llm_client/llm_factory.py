@@ -685,14 +685,61 @@ class OpenAICompatibleChatLLMService(LLMService):
                 return "".join(parts)
             return ""
 
+        def _extract_text_and_think_from_value(v: Any) -> Tuple[str, str]:
+            """Split provider content blocks into user-visible text vs reasoning text.
+
+            Some OpenAI-compatible providers stream `delta.content` as a list of
+            typed blocks (for example type=reasoning). Those reasoning blocks
+            should feed the think panel, not the main chat text.
+            """
+            if isinstance(v, str):
+                return v, ""
+
+            if isinstance(v, list):
+                text_parts: List[str] = []
+                think_parts: List[str] = []
+                for item in v:
+                    if isinstance(item, str):
+                        text_parts.append(item)
+                        continue
+
+                    data = item if isinstance(item, dict) else _as_dict(item)
+                    if not isinstance(data, dict):
+                        continue
+
+                    part = _extract_text_from_value(data.get("text") or data.get("content"))
+                    if not part:
+                        continue
+
+                    item_type = str(data.get("type") or data.get("role") or "").lower()
+                    if any(tag in item_type for tag in ("reason", "think", "thought")):
+                        think_parts.append(part)
+                    else:
+                        text_parts.append(part)
+
+                return "".join(text_parts), "".join(think_parts)
+
+            data = _as_dict(v)
+            if isinstance(data, dict):
+                part = _extract_text_from_value(data.get("text") or data.get("content"))
+                if not part:
+                    return "", ""
+                item_type = str(data.get("type") or data.get("role") or "").lower()
+                if any(tag in item_type for tag in ("reason", "think", "thought")):
+                    return "", part
+                return part, ""
+
+            return "", ""
+
         def _extract_delta_text_and_think(delta: Any) -> Tuple[str, str]:
             if delta is None:
                 return "", ""
 
             delta_dict = _as_dict(delta)
             if isinstance(delta_dict, dict):
-                text = _extract_text_from_value(delta_dict.get("content") or delta_dict.get("text"))
-                think = ""
+                text, think = _extract_text_and_think_from_value(delta_dict.get("content"))
+                if not text:
+                    text = _extract_text_from_value(delta_dict.get("text"))
                 for key in [
                     "reasoning_content",
                     "reasoning",
@@ -701,13 +748,15 @@ class OpenAICompatibleChatLLMService(LLMService):
                     "reasoning_text",
                     "thought",
                 ]:
-                    think = _extract_text_from_value(delta_dict.get(key))
-                    if think:
+                    extra_think = _extract_text_from_value(delta_dict.get(key))
+                    if extra_think:
+                        think += extra_think
                         break
                 return text, think
 
-            text = _extract_text_from_value(getattr(delta, "content", None) or getattr(delta, "text", None))
-            think = ""
+            text, think = _extract_text_and_think_from_value(getattr(delta, "content", None))
+            if not text:
+                text = _extract_text_from_value(getattr(delta, "text", None))
             for key in [
                 "reasoning_content",
                 "reasoning",
@@ -716,8 +765,9 @@ class OpenAICompatibleChatLLMService(LLMService):
                 "reasoning_text",
                 "thought",
             ]:
-                think = _extract_text_from_value(getattr(delta, key, None))
-                if think:
+                extra_think = _extract_text_from_value(getattr(delta, key, None))
+                if extra_think:
+                    think += extra_think
                     break
             return text, think
 

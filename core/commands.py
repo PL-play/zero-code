@@ -79,7 +79,13 @@ def _handle_skills(**_):
     for name, skill in SKILL_LOADER.skills.items():
         desc = skill["meta"].get("description", "-")
         tags = skill["meta"].get("tags", "-")
-        rel_path = str(Path(skill["path"]).relative_to(AGENT_DIR))
+        skill_path = Path(skill["path"]).resolve()
+        if skill_path.is_relative_to(SKILLS_DIR.resolve()):
+            rel_path = str(skill_path.relative_to(SKILLS_DIR.resolve()))
+        elif skill_path.is_relative_to(AGENT_DIR.resolve()):
+            rel_path = str(skill_path.relative_to(AGENT_DIR.resolve()))
+        else:
+            rel_path = str(skill_path)
         table.add_row(name, desc, str(tags), rel_path)
     panel = Panel(
         table,

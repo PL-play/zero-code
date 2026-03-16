@@ -2,11 +2,12 @@ from __future__ import annotations
 
 from functools import lru_cache
 import mimetypes
+import os
 import re
 from pathlib import Path
 from typing import Any, List
 
-from core.runtime import AGENT_DIR, WORKDIR, safe_path
+from core.runtime import AGENT_DIR, WORKSPACE_DIR, safe_path
 from llm_client.multimodal import create_attachment_ref
 
 
@@ -16,24 +17,26 @@ ATTACHMENT_START_RE = re.compile(r"(?<!\S)@")
 ATTACHMENT_SUGGESTION_LIMIT = 8
 ATTACHMENT_GLOBAL_SCAN_LIMIT = 5000
 ATTACHMENT_SKIP_DIRS = {".git", ".venv", "node_modules", "__pycache__"}
+ATTACHMENT_INCLUDE_AGENT_ROOT = (os.getenv("ZERO_CODE_ATTACHMENT_INCLUDE_AGENT_ROOT", "0").strip().lower() in {"1", "true", "yes", "on"})
 
 
 def _iter_attachment_roots() -> list[Path]:
-    roots: list[Path] = []
-    for root in (WORKDIR, AGENT_DIR):
-        if root not in roots:
-            roots.append(root)
+    roots: list[Path] = [WORKSPACE_DIR]
+    if ATTACHMENT_INCLUDE_AGENT_ROOT and AGENT_DIR not in roots:
+        roots.append(AGENT_DIR)
     return roots
 
 
 def _display_path(path: Path) -> str:
+    resolved = path.resolve()
+    if resolved.is_relative_to(WORKSPACE_DIR):
+        return resolved.relative_to(WORKSPACE_DIR).as_posix()
+    if resolved.is_relative_to(AGENT_DIR):
+        return f"@agent/{resolved.relative_to(AGENT_DIR).as_posix()}"
     try:
-        return path.resolve().relative_to(WORKDIR).as_posix()
+        return resolved.as_posix()
     except Exception:
-        try:
-            return path.resolve().relative_to(AGENT_DIR).as_posix()
-        except Exception:
-            return path.resolve().as_posix()
+        return str(path)
 
 
 def _build_suggestion_label(path: Path, value: str, kind: str) -> str:
