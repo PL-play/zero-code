@@ -1396,7 +1396,26 @@ Type your request below to get started. Use `/help` for commands.
         def _log():
             try:
                 log = self.query_one("#agent_logs", SelectableRichLog)
-                log.write(text)
+
+                # 对 bash 工具调用的详细输出做轻量格式化：高亮首行 + 底部分隔线，不再额外加竖线前缀。
+                lines = str(text).split("\n")
+                if (
+                    len(lines) >= 2
+                    and " bash:" in lines[0]
+                    and lines[0].lstrip().startswith("[")
+                ):
+                    header = lines[0]
+                    body_lines = lines[1:]
+                    # 去掉末尾的由 state.tool_call 加的分隔线，让我们自己画框。
+                    if body_lines and set(body_lines[-1].strip()) == {"-"}:
+                        body_lines = body_lines[:-1]
+
+                    log.write(f"[bold #00FFCC]{header}[/bold #00FFCC]")
+                    for bl in body_lines:
+                        log.write(bl.rstrip())
+                    log.write("[dim]" + "─" * 40 + "[/dim]")
+                else:
+                    log.write(text)
             except Exception:
                 pass
                 

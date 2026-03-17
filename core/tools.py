@@ -192,7 +192,11 @@ class BashSession:
     def execute(self, command: str, timeout: int = 120) -> str:
         dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
         if any(d in command for d in dangerous):
-            return "Error: Dangerous command blocked"
+            return (
+                "Error: Dangerous command blocked.\n"
+                "For safety, interactive or privileged commands (like sudo / shutdown) "
+                "must be run manually in your own terminal, not via the agent bash tool."
+            )
 
         if self._proc is None or self._proc.poll() is not None:
             self._start()
@@ -266,7 +270,11 @@ class BackgroundManager:
     def run(self, command: str) -> str:
         dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
         if any(d in command for d in dangerous):
-            return "Error: Dangerous command blocked"
+            return (
+                "Error: Dangerous command blocked.\n"
+                "Background tasks do not support interactive or privileged commands "
+                "(like sudo / shutdown). Please run these manually in your own shell."
+            )
 
         scope_err = _validate_bash_command_scope(command)
         if scope_err:
