@@ -16,6 +16,9 @@ from rich.text import Text
 from llm_client.interface import LLMRequest
 
 from core.runtime import AGENT_DIR, MODEL, SKILLS_DIR, WORKSPACE_DIR, client
+from core.events import DEFAULT_EVENT_BUS
+from core.types import AgentEvent, AgentEventType, AgentMessage, ToolCall
+from core.ui_adapter import UIAdapter
 
 TOOL_MAX_LINES = 20
 
@@ -30,7 +33,10 @@ def _format_path_for_ui(path: Path) -> str:
 
 
 class TUIAdapter:
-    """Bridge between synchronous agent codebase and the Textual App events."""
+    """Bridge between synchronous agent codebase and the Textual App events.
+
+    This class also acts as the default implementation of `UIAdapter`.
+    """
 
     def __init__(self):
         self._current_todo = ""
@@ -159,6 +165,22 @@ class TUIAdapter:
         detailed_entry = f"[{ts}] {prefix} {name}:\n{output_str}\n" + "-"*40
 
         self._safe_dispatch("agent_log", detailed_entry)
+        # Broadcast a structured TOOL_CALL_COMPLETED event for non-UI consumers.
+        try:
+            DEFAULT_EVENT_BUS.publish(
+                AgentEvent(
+                    type=AgentEventType.TOOL_CALL_COMPLETED,
+                    payload={
+                        "name": name,
+                        "output": output,
+                        "is_sub": is_sub,
+                        "tool_input": tool_input or {},
+                    },
+                )
+            )
+        except Exception:
+            # UI logging should never fail due to event-bus issues.
+            pass
         if not is_sub:
             brief = self._tool_brief(name, tool_input, output)
             self._safe_dispatch("append_tool_brief", brief)
@@ -172,6 +194,15 @@ class TUIAdapter:
                     if isinstance(paths, list) and paths:
                         self._safe_dispatch("set_pending_image_paths", [str(path) for path in paths], name)
         self._safe_dispatch("set_status", f"Running: {name}...")
+        try:
+            DEFAULT_EVENT_BUS.publish(
+                AgentEvent(
+                    type=AgentEventType.STATUS_CHANGED,
+                    payload={"status": f"Running: {name}..."},
+                )
+            )
+        except Exception:
+            pass
 
         # Terminal tab is user-only; agent tool outputs go to logs instead
 
@@ -321,7 +352,14 @@ class TUIAdapter:
         try:
             ctx = globals().get("CTX")
             if ctx is not None:
-                self._safe_dispatch("update_usage", ctx.all_usage_summary())
+                summary = ctx.all_usage_summary()
+                self._safe_dispatch("update_usage", summary)
+                DEFAULT_EVENT_BUS.publish(
+                    AgentEvent(
+                        type=AgentEventType.USAGE_UPDATED,
+                        payload={"summary": summary},
+                    )
+                )
         except Exception:
             pass
 
@@ -332,17 +370,37 @@ class TUIAdapter:
         self._safe_dispatch("set_status", "Idle")
 
     def stream_start(self):
+        # Backwards-compatible: still drive Textual directly,
+        # but also emit a structured agent event for other consumers.
+        DEFAULT_EVENT_BUS.publish(
+            AgentEvent(type=AgentEventType.STREAM_STARTED, payload={"kind": "assistant_text"})
+        )
         self._safe_dispatch("stream_start")
 
     def stream_text(self, text: str):
         if text:
+            DEFAULT_EVENT_BUS.publish(
+                AgentEvent(
+                    type=AgentEventType.STREAM_DELTA,
+                    payload={"stream_id": "main", "text": text, "is_think": False},
+                )
+            )
             self._safe_dispatch("append_stream_text", text)
 
     def stream_think(self, think: str):
         if think:
+            DEFAULT_EVENT_BUS.publish(
+                AgentEvent(
+                    type=AgentEventType.STREAM_THINK_DELTA,
+                    payload={"stream_id": "main", "text": think, "is_think": True},
+                )
+            )
             self._safe_dispatch("append_stream_think", think)
 
     def stream_end(self):
+        DEFAULT_EVENT_BUS.publish(
+            AgentEvent(type=AgentEventType.STREAM_COMPLETED, payload={"stream_id": "main"})
+        )
         self._safe_dispatch("stream_end")
 
     def set_round_tools_present(self, has_tools: bool):
@@ -388,6 +446,36 @@ class TUIAdapter:
         ts = self._ts()
         entry = f"[{ts}] {text}"
         self._safe_dispatch("system_log", entry)
+
+    # ===== UIAdapter-compatible API =====================================
+
+    def show_message(self, message: AgentMessage, *, elapsed: float | None = None) -> None:
+        """Display a chat message in the main history panel."""
+        role = message.role
+        content = message.content
+        style = "agent" if role == "assistant" else role
+        self._safe_dispatch("append_chat", content, style, elapsed)
+
+    def update_status(self, text: str) -> None:
+        self._safe_dispatch("set_status", text)
+
+    def log_agent(self, text: str) -> None:
+        self._safe_dispatch("agent_log", text)
+
+    def update_usage(self, usage_summary: str) -> None:
+        self._safe_dispatch("update_usage", usage_summary)
+
+    def show_tool_call_brief(self, name: str, brief: str) -> None:
+        self._safe_dispatch("append_tool_brief", brief)
+
+    def show_tool_call_detail(self, name: str, output: str, tool_input: dict | None = None) -> None:
+        self.tool_call(name, output, is_sub=False, tool_input=tool_input or {})
+
+    def handle_stream_delta(self, stream_id: str, text: str, *, is_think: bool) -> None:
+        if is_think:
+            self.stream_think(text)
+        else:
+            self.stream_text(text)
 
 
 # Initialize global UI Instance (Replacing ConsoleUI)

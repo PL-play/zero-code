@@ -7,6 +7,8 @@ from llm_client.interface import LLMRequest
 
 from core.runtime import AGENT_DIR, MODEL, SKILLS_DIR, WORKSPACE_DIR, client
 from core.state import CTX, ContextManager, SKILL_LOADER, TODO, UI
+from core.events import DEFAULT_EVENT_BUS
+from core.types import AgentEvent, AgentEventType
 from core.tools import CHILD_TOOLS, EXPLORE_TOOLS, PARENT_TOOLS, TOOL_HANDLERS
 
 SYSTEM = f"""\
@@ -432,6 +434,7 @@ def run_subagent(
 async def _agent_loop_async(messages: list, stop_event: threading.Event | None = None) -> str:
     rounds_since_todo = 0
     UI.new_tool_cycle()
+    DEFAULT_EVENT_BUS.publish(AgentEvent(type=AgentEventType.SESSION_STARTED, payload={}))
 
     for round_idx in range(MAX_AGENT_ROUNDS):
         if _is_cancelled(stop_event):
@@ -446,6 +449,12 @@ async def _agent_loop_async(messages: list, stop_event: threading.Event | None =
 
         if CTX.should_compact():
             UI.console.print(f"[dim]{UI._ts()} [auto-compact triggered, saving transcript...][/dim]")
+            DEFAULT_EVENT_BUS.publish(
+                AgentEvent(
+                    type=AgentEventType.STATUS_CHANGED,
+                    payload={"status": "auto-compact triggered, saving transcript..."},
+                )
+            )
             messages[:] = await CTX.compact_async(messages)
             CTX.reset_usage()
 
@@ -453,6 +462,7 @@ async def _agent_loop_async(messages: list, stop_event: threading.Event | None =
         if todo_snap:
             messages.append({"role": "user", "content": todo_snap})
 
+        # Start a new response stream for this round
         if hasattr(UI, "stream_start"):
             UI.stream_start()
 
@@ -465,6 +475,8 @@ async def _agent_loop_async(messages: list, stop_event: threading.Event | None =
                 max_tokens=8000,
                 temperature=0,
             ),
+            # Route streaming chunks through UI adapter, which now also
+            # emits structured AgentEvent STREAM_DELTA / STREAM_THINK_DELTA.
             on_chunk_delta_text=getattr(UI, "stream_text", None),
             on_chunk_think=getattr(UI, "stream_think", None),
         )
@@ -480,6 +492,12 @@ async def _agent_loop_async(messages: list, stop_event: threading.Event | None =
             f"[dim]{UI._ts()} round {round_idx+1}/{MAX_AGENT_ROUNDS} | "
             f"{usage['input']:,}in {usage['output']:,}out | session: {usage['total_in']:,}+{usage['total_out']:,}[/dim]",
             end="\r",
+        )
+        DEFAULT_EVENT_BUS.publish(
+            AgentEvent(
+                type=AgentEventType.USAGE_UPDATED,
+                payload={"usage": usage},
+            )
         )
 
         # Push usage to TUI after every round (not just on todo updates)
@@ -556,6 +574,12 @@ async def _agent_loop_async(messages: list, stop_event: threading.Event | None =
         LLMRequest(messages=messages, system_prompt=SYSTEM, max_tokens=8000, temperature=0)
     )
     CTX.update_usage(response)
+    DEFAULT_EVENT_BUS.publish(
+        AgentEvent(
+            type=AgentEventType.SESSION_ENDED,
+            payload={"reason": "hit_round_limit"},
+        )
+    )
     return f"[hit {MAX_AGENT_ROUNDS}-round limit]\n" + _assistant_text(response)
 
 

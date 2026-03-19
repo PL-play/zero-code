@@ -15,6 +15,7 @@ ZeroCode 是一个交互式 CLI 编程 Agent，基于 Textual TUI 构建，支�
 | **阈值持久会话** | bash 命令保持会话状态，跨轮次持久 |
 | **技能系统** | 支持加载外部技能扩展功能 |
 | **TUI 界面** | Cyberpunk 主题，实时显示 Agent 思考过程 |
+| **事件总线 & Hook** | Agent 与 UI 通过事件与钩子解耦，可挂载多种前端 |
 
 ### 技术栈
 
@@ -29,15 +30,22 @@ ZeroCode 是一个交互式 CLI 编程 Agent，基于 Textual TUI 构建，支�
 flowchart TB
     subgraph User["用户层"]
         Input[用户输入查询]
-        UI[Textual TUI<br/>Cyberpunk 主题界面]
+        TextualUI[Textual TUI<br/>Cyberpunk 界面]
+        Headless["Headless CLI<br/>(stdout/stderr)"]
     end
 
     subgraph AgentCore["Agent 核心 (core/agent.py)"]
         Loop["_agent_loop_async<br/>主循环 (最多100轮)"]
         LLM["LLM 调用<br/>client.complete()"]
-        ToolCall[解析 Tool Calls]
+        ToolCallNode[解析 Tool Calls]
         Execute[执行工具]
         Compact["上下文压缩<br/>compact_async()"]
+    end
+
+    subgraph Events["事件与 Hooks"]
+        Bus["AgentEventBus<br/>(core/events.py)"]
+        Hooks["AgentHooks<br/>(core/hooks.py)"]
+        EventTypes["AgentEventType<br/>STREAM/TOOL/USAGE..."]
     end
 
     subgraph Tools["工具层 (core/tools.py)"]
@@ -73,11 +81,16 @@ flowchart TB
         SL["SkillLoader<br/>技能加载器"]
     end
 
+    subgraph UIAdapters["UI 适配层"]
+        TUIAdapterNode["TUIAdapter<br/>(core/state.py)"]
+        HeadlessAdapter["HeadlessUI<br/>(core/headless_ui.py)"]
+    end
+
     subgraph SubAgent["子 Agent"]
         SARun["_run_subagent_async"]
         SAMode{"mode 参数"}
         Explore["explore 模式<br/>只读"]
-        Execute["execute 模式<br/>读写"]
+        ExecuteMode["execute 模式<br/>读写"]
     end
 
     subgraph LLMClient["LLM 客户端 (llm_client/)"]
@@ -87,16 +100,20 @@ flowchart TB
     end
 
     %% 连接关系
-    Input --> UI
-    UI --> |"process_agent_query"| Loop
+    Input --> TextualUI
+    Input --> Headless
+
+    TextualUI --> |"process_agent_query"| Loop
+    Headless --> |"调用 agent_loop"| Loop
     
     Loop --> |"1. 发送消息"| LLM
-    LLM --> |"2. 流式响应"| Loop
+    LLM --> |"2. 流式响应 (on_chunk_xxx)"| Loop
+    Loop --> |"STREAM_* 事件"| Bus
     
-    Loop --> |has tool_calls| ToolCall
-    ToolCall --> |sub_agent| Execute
-    
+    Loop --> |"has tool_calls"| ToolCallNode
+    ToolCallNode --> |"执行工具"| Execute
     Execute --> TB
+
     TB --> RF
     TB --> WF
     TB --> EF
@@ -112,16 +129,25 @@ flowchart TB
     SA --> |"创建子Agent"| SARun
     SARun --> SAMode
     SAMode --> |"explore"| Explore
-    SAMode --> |"execute"| Execute
+    SAMode --> |"execute"| ExecuteMode
     
     Loop --> |"token超阈值"| Compact
     Compact --> CTX
     
     CTX -.-> |track_file| TM
     CTX -.-> |snapshot| TM
+
+    %% 事件广播到 UI 适配器
+    Loop --> |"STATUS/USAGE/TOOL 事件"| Bus
+    Bus --> TUIAdapterNode
+    Bus --> HeadlessAdapter
+
+    TUIAdapterNode --> TextualUI
+    HeadlessAdapter --> Headless
     
-    Loop --> |"完成"| UI
-    UI --> |"显示结果"| Input
+    Loop --> |"完成"| Bus
+    Bus --> |"SESSION_ENDED 事件"| TUIAdapterNode
+    Bus --> |"SESSION_ENDED 事件"| HeadlessAdapter
 ```
 
 ## 详细流程说明
