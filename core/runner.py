@@ -114,14 +114,14 @@ class AgentRunner:
         """Sync entry: runs :func:`core.agent.agent_loop` under this runner's context."""
         from core.agent import agent_loop
 
-        with self.session(self):
+        with self.session():
             return agent_loop(messages, stop_event=stop_event)
 
     async def run_async(self, messages: list, stop_event=None) -> str:
         """Async entry: await :func:`core.agent.agent_loop_async` under context."""
         from core.agent import agent_loop_async
 
-        async with self.session_async(self):
+        async with self.session_async():
             return await agent_loop_async(messages, stop_event=stop_event)
 
 
