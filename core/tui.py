@@ -30,6 +30,11 @@ from rich.segment import Segment
 from textual.strip import Strip
 from textual.selection import Selection
 
+from core.events import DEFAULT_EVENT_BUS, AgentEventBus
+from core.runner import AgentRunner
+from core.state import UI
+from core.types import AgentEvent, AgentEventType
+
 
 class SelectableRichLog(RichLog):
     """RichLog subclass that supports mouse text selection and Ctrl+C copy.
@@ -1049,8 +1054,10 @@ class ZeroCodeApp(App):
         Binding("ctrl+m", "toggle_raw_reply", "Raw/MD", show=True),
     ]
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, event_bus: AgentEventBus | None = None, **kwargs):
         super().__init__(*args, **kwargs)
+        self._event_bus = event_bus if event_bus is not None else DEFAULT_EVENT_BUS
+        self._agent_runner = AgentRunner(event_bus=self._event_bus)
         self.history = []
         self._stream_chunk_count = 0
         self._stream_think_count = 0
@@ -1179,6 +1186,109 @@ Type your request below to get started. Use `/help` for commands.
         self.set_interval(0.12, self._tick_run_status)
         self.set_interval(10, self._periodic_git_refresh)
         self._refresh_git_info()
+
+        # Agent core -> UI adapter event mapping.
+        # The core publishes AgentEvent; Textual only consumes and renders them.
+        def _sub_session_started(e: AgentEvent):
+            _ = e
+            try:
+                UI.new_tool_cycle()
+            except Exception:
+                pass
+
+        def _sub_stream_started(e: AgentEvent):
+            _ = e
+            # Ensure main-thread meta logic sees streaming immediately,
+            # even if UI rendering is dispatched asynchronously.
+            self._stream_chunk_count = 0
+            self._stream_think_count = 0
+            UI.stream_start()
+
+        def _sub_stream_delta(e: AgentEvent):
+            if self._stream_chunk_count == 0:
+                self._stream_chunk_count = 1
+            UI.stream_text(str(e.payload.get("text") or ""))
+
+        def _sub_stream_think_delta(e: AgentEvent):
+            if self._stream_chunk_count == 0:
+                self._stream_chunk_count = 1
+            if self._stream_think_count == 0:
+                self._stream_think_count = 1
+            UI.stream_think(str(e.payload.get("text") or ""))
+
+        def _sub_stream_completed(e: AgentEvent):
+            _ = e
+            UI.stream_end()
+
+        def _sub_tool_call_completed(e: AgentEvent):
+            payload = e.payload or {}
+            UI.tool_call(
+                str(payload.get("name") or "unknown"),
+                str(payload.get("output") or ""),
+                is_sub=bool(payload.get("is_sub", False)),
+                tool_input=payload.get("tool_input") or {},
+            )
+
+        def _sub_status_changed(e: AgentEvent):
+            payload = e.payload or {}
+            UI.update_status(str(payload.get("status") or ""))
+
+        def _sub_usage_updated(e: AgentEvent):
+            payload = e.payload or {}
+            UI.update_usage(str(payload.get("summary") or ""))
+
+        def _sub_todo_updated(e: AgentEvent):
+            payload = e.payload or {}
+            UI.update_todo(str(payload.get("text") or ""))
+
+        def _sub_user_notification(e: AgentEvent):
+            payload = e.payload or {}
+            UI.nag_reminder(payload.get("message") or None)
+
+        def _sub_round_tools_present(e: AgentEvent):
+            payload = e.payload or {}
+            UI.set_round_tools_present(bool(payload.get("has_tools", False)))
+
+        def _sub_subagent_task_start(e: AgentEvent):
+            payload = e.payload or {}
+            UI.task_start(str(payload.get("desc") or "subtask"), str(payload.get("prompt_preview") or ""))
+
+        def _sub_subagent_text(e: AgentEvent):
+            payload = e.payload or {}
+            UI.subagent_text(str(payload.get("text") or ""))
+
+        def _sub_subagent_limit(e: AgentEvent):
+            payload = e.payload or {}
+            UI.subagent_limit(int(payload.get("max_rounds") or 0))
+
+        def _sub_system_log(e: AgentEvent):
+            payload = e.payload or {}
+            UI.debug(str(payload.get("text") or ""))
+
+        def _sub_session_ended(e: AgentEvent):
+            _ = e
+            try:
+                UI.show_reply("")
+            except Exception:
+                pass
+
+        self._event_bus.subscribe(AgentEventType.SESSION_STARTED, _sub_session_started)
+        self._event_bus.subscribe(AgentEventType.STREAM_STARTED, _sub_stream_started)
+        self._event_bus.subscribe(AgentEventType.STREAM_DELTA, _sub_stream_delta)
+        self._event_bus.subscribe(AgentEventType.STREAM_THINK_DELTA, _sub_stream_think_delta)
+        self._event_bus.subscribe(AgentEventType.STREAM_COMPLETED, _sub_stream_completed)
+        self._event_bus.subscribe(AgentEventType.TOOL_CALL_COMPLETED, _sub_tool_call_completed)
+        self._event_bus.subscribe(AgentEventType.STATUS_CHANGED, _sub_status_changed)
+        self._event_bus.subscribe(AgentEventType.USAGE_UPDATED, _sub_usage_updated)
+        self._event_bus.subscribe(AgentEventType.TODO_UPDATED, _sub_todo_updated)
+        self._event_bus.subscribe(AgentEventType.USER_NOTIFICATION, _sub_user_notification)
+        self._event_bus.subscribe(AgentEventType.ROUND_TOOLS_PRESENT, _sub_round_tools_present)
+        self._event_bus.subscribe(AgentEventType.SUBAGENT_TASK_START, _sub_subagent_task_start)
+        self._event_bus.subscribe(AgentEventType.SUBAGENT_TEXT, _sub_subagent_text)
+        self._event_bus.subscribe(AgentEventType.SUBAGENT_LIMIT, _sub_subagent_limit)
+        self._event_bus.subscribe(AgentEventType.SYSTEM_LOG, _sub_system_log)
+        self._event_bus.subscribe(AgentEventType.SESSION_ENDED, _sub_session_ended)
+
         self._set_think_visible(False)
         self._set_tool_chain_visible(False)
         input_widget = self.query_one(ChatInput)
@@ -1984,7 +2094,6 @@ Type your request below to get started. Use `/help` for commands.
             self.append_chat(f"Unknown command: `{cmd_name}`. Available: {known}", "system")
 
     async def process_agent_query(self, user_message: dict):
-        from core.agent import agent_loop
         self.history.append(user_message)
         query = message_preview_text(user_message)
         
@@ -1992,7 +2101,9 @@ Type your request below to get started. Use `/help` for commands.
         self.system_log(f"Starting agent query: {query}")
         try:
             cancel_event = self._agent_cancel_event or threading.Event()
-            reply = await asyncio.to_thread(agent_loop, self.history, cancel_event)
+            reply = await asyncio.to_thread(
+                self._agent_runner.run, self.history, cancel_event
+            )
             elapsed = time.time() - start_time
             self.system_log(f"Agent reply received, took {elapsed:.2f}s")
             if reply == "[cancelled by user]":

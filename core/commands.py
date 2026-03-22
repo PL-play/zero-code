@@ -5,7 +5,8 @@ from rich.table import Table
 from rich.text import Text
 
 from core.runtime import AGENT_DIR, SKILLS_DIR
-from core.state import COMPACT_THRESHOLD, CTX, SKILL_LOADER, UI
+from core.state import COMPACT_THRESHOLD, CTX, SKILL_LOADER
+from core.ui_registry import get_ui
 
 SLASH_COMMANDS = [
     {"name": "/help", "args": "", "description": "Show available commands"},
@@ -30,6 +31,9 @@ def rewrite_attach_command(raw_query: str) -> str | None:
 
 
 def _handle_help(**_):
+    ui = get_ui()
+    if ui is None:
+        return
     table = Table(show_header=True, border_style="blue", padding=(0, 1), expand=True)
     table.add_column("Command", style="bold cyan", no_wrap=True)
     table.add_column("Description")
@@ -45,18 +49,24 @@ def _handle_help(**_):
         border_style="blue",
         padding=(0, 1),
     )
-    UI.console.print(panel)
+    ui.console.print(panel)
 
 
 def _handle_compact(raw_query: str, history: list):
     focus = raw_query.strip()[len("/compact"):].strip() or None
-    UI.console.print(f"[dim]{UI._ts()} Compacting conversation...[/dim]")
+    ui = get_ui()
+    if ui is None:
+        return
+    ui.console.print(f"[dim]{ui._ts()} Compacting conversation...[/dim]")
     history[:] = CTX.compact(history, focus=focus)
     CTX.reset_usage()
-    UI.console.print(f"[dim]{UI._ts()} Done. Context compacted. {len(history)} messages remaining.[/dim]")
+    ui.console.print(f"[dim]{ui._ts()} Done. Context compacted. {len(history)} messages remaining.[/dim]")
 
 
 def _handle_context(**_):
+    ui = get_ui()
+    if ui is None:
+        return
     usage_text = CTX.all_usage_summary()
     panel = Panel(
         Text(f"{usage_text}\nmessages={len(_['history'])} | compact_threshold={COMPACT_THRESHOLD:,}"),
@@ -64,12 +74,15 @@ def _handle_context(**_):
         border_style="yellow",
         padding=(0, 1),
     )
-    UI.console.print(panel)
+    ui.console.print(panel)
 
 
 def _handle_skills(**_):
+    ui = get_ui()
+    if ui is None:
+        return
     if not SKILL_LOADER.skills:
-        UI.console.print(f"[dim]{UI._ts()} No skills found in {SKILLS_DIR}/[/dim]")
+        ui.console.print(f"[dim]{ui._ts()} No skills found in {SKILLS_DIR}/[/dim]")
         return
     table = Table(show_header=True, border_style="magenta", padding=(0, 1), expand=True)
     table.add_column("Name", style="bold cyan", no_wrap=True)
@@ -94,7 +107,7 @@ def _handle_skills(**_):
         border_style="magenta",
         padding=(0, 1),
     )
-    UI.console.print(panel)
+    ui.console.print(panel)
 
 
 COMMAND_DISPATCH = {
