@@ -1,13 +1,14 @@
 import asyncio
 import json
 import threading
+from datetime import datetime
 from typing import Any
 
 from llm_client.interface import LLMRequest
 
 from core.runtime import AGENT_DIR, MODEL, SKILLS_DIR, WORKSPACE_DIR, client
-from core.state import CTX, ContextManager, SKILL_LOADER, TODO, UI
-from core.events import DEFAULT_EVENT_BUS
+from core.state import CTX, ContextManager, SKILL_LOADER, TODO
+from core.agent_context import get_event_bus
 from core.types import AgentEvent, AgentEventType
 from core.tools import CHILD_TOOLS, EXPLORE_TOOLS, PARENT_TOOLS, TOOL_HANDLERS
 
@@ -195,10 +196,9 @@ def _debug_tool_call(tool_call: dict[str, Any]) -> None:
         lines.append(f"  raw_arguments: {raw_str}")
         lines.append("  ⚠ arguments is NOT valid JSON")
 
-    try:
-        UI._safe_dispatch("system_log", "\n".join(lines))
-    except Exception:
-        pass
+    get_event_bus().publish(
+        AgentEvent(type=AgentEventType.SYSTEM_LOG, payload={"text": "\n".join(lines)})
+    )
 
 
 def _tool_call_name(tool_call: dict[str, Any]) -> str:
@@ -339,7 +339,12 @@ async def _run_subagent_async(
         text = _assistant_text(response)
         for line in text.splitlines():
             if line.strip():
-                UI.subagent_text(line)
+                get_event_bus().publish(
+                    AgentEvent(
+                        type=AgentEventType.SUBAGENT_TEXT,
+                        payload={"text": line, "label": label},
+                    )
+                )
 
         tool_calls = response.get_tool_calls()
 
@@ -369,7 +374,17 @@ async def _run_subagent_async(
                     output = handler(**tool_args) if handler else f"Unknown tool: {tool_name}"
                 except Exception as e:
                     output = f"Error: {e}"
-            UI.tool_call(tool_name, output, is_sub=True, tool_input=tool_args)
+            get_event_bus().publish(
+                AgentEvent(
+                    type=AgentEventType.TOOL_CALL_COMPLETED,
+                    payload={
+                        "name": tool_name,
+                        "output": output,
+                        "is_sub": True,
+                        "tool_input": tool_args,
+                    },
+                )
+            )
             sub_messages.append(
                 {
                     "role": "tool",
@@ -380,7 +395,17 @@ async def _run_subagent_async(
             )
 
         if sub_ctx.should_compact():
-            UI.tool_call("compact", f"subagent auto-compact at round {round_idx+1}", is_sub=True)
+            get_event_bus().publish(
+                AgentEvent(
+                    type=AgentEventType.TOOL_CALL_COMPLETED,
+                    payload={
+                        "name": "compact",
+                        "output": f"subagent auto-compact at round {round_idx+1}",
+                        "is_sub": True,
+                        "tool_input": {},
+                    },
+                )
+            )
             sub_messages = await sub_ctx.compact_async(sub_messages)
             sub_ctx.reset_usage()
     else:
@@ -391,7 +416,12 @@ async def _run_subagent_async(
         return "(no summary)"
 
     if hit_limit:
-        UI.subagent_limit(max_rounds)
+        get_event_bus().publish(
+            AgentEvent(
+                type=AgentEventType.SUBAGENT_LIMIT,
+                payload={"max_rounds": max_rounds, "label": label},
+            )
+        )
         sub_messages.append(
             {
                 "role": "user",
@@ -433,8 +463,7 @@ def run_subagent(
 
 async def _agent_loop_async(messages: list, stop_event: threading.Event | None = None) -> str:
     rounds_since_todo = 0
-    UI.new_tool_cycle()
-    DEFAULT_EVENT_BUS.publish(AgentEvent(type=AgentEventType.SESSION_STARTED, payload={}))
+    get_event_bus().publish(AgentEvent(type=AgentEventType.SESSION_STARTED, payload={"scope": "main"}))
 
     for round_idx in range(MAX_AGENT_ROUNDS):
         if _is_cancelled(stop_event):
@@ -442,14 +471,18 @@ async def _agent_loop_async(messages: list, stop_event: threading.Event | None =
 
         if rounds_since_todo >= 5 and TODO.has_in_progress:
             messages.append({"role": "user", "content": "<reminder>You have an in_progress todo. Update your todos.</reminder>"})
-            UI.nag_reminder()
+            get_event_bus().publish(
+                AgentEvent(
+                    type=AgentEventType.USER_NOTIFICATION,
+                    payload={"message": "update your todos"},
+                )
+            )
             rounds_since_todo = 0
 
         CTX.microcompact(messages)
 
         if CTX.should_compact():
-            UI.console.print(f"[dim]{UI._ts()} [auto-compact triggered, saving transcript...][/dim]")
-            DEFAULT_EVENT_BUS.publish(
+            get_event_bus().publish(
                 AgentEvent(
                     type=AgentEventType.STATUS_CHANGED,
                     payload={"status": "auto-compact triggered, saving transcript..."},
@@ -463,8 +496,27 @@ async def _agent_loop_async(messages: list, stop_event: threading.Event | None =
             messages.append({"role": "user", "content": todo_snap})
 
         # Start a new response stream for this round
-        if hasattr(UI, "stream_start"):
-            UI.stream_start()
+        get_event_bus().publish(
+            AgentEvent(type=AgentEventType.STREAM_STARTED, payload={"stream_id": "main"})
+        )
+
+        def _on_delta(text: str):
+            if text:
+                get_event_bus().publish(
+                    AgentEvent(
+                        type=AgentEventType.STREAM_DELTA,
+                        payload={"stream_id": "main", "text": text, "is_think": False},
+                    )
+                )
+
+        def _on_think(text: str):
+            if text:
+                get_event_bus().publish(
+                    AgentEvent(
+                        type=AgentEventType.STREAM_THINK_DELTA,
+                        payload={"stream_id": "main", "text": text, "is_think": True},
+                    )
+                )
 
         response = await client.complete(
             LLMRequest(
@@ -475,40 +527,43 @@ async def _agent_loop_async(messages: list, stop_event: threading.Event | None =
                 max_tokens=8000,
                 temperature=0,
             ),
-            # Route streaming chunks through UI adapter, which now also
-            # emits structured AgentEvent STREAM_DELTA / STREAM_THINK_DELTA.
-            on_chunk_delta_text=getattr(UI, "stream_text", None),
-            on_chunk_think=getattr(UI, "stream_think", None),
+            on_chunk_delta_text=_on_delta,
+            on_chunk_think=_on_think,
         )
 
         if todo_snap:
             messages.pop()
 
-        if hasattr(UI, "stream_end"):
-            UI.stream_end()
+        get_event_bus().publish(
+            AgentEvent(type=AgentEventType.STREAM_COMPLETED, payload={"stream_id": "main"})
+        )
 
         usage = CTX.update_usage(response)
-        UI.console.print(
-            f"[dim]{UI._ts()} round {round_idx+1}/{MAX_AGENT_ROUNDS} | "
-            f"{usage['input']:,}in {usage['output']:,}out | session: {usage['total_in']:,}+{usage['total_out']:,}[/dim]",
-            end="\r",
+        ts = datetime.now().strftime("%H:%M:%S")
+        get_event_bus().publish(
+            AgentEvent(
+                type=AgentEventType.STATUS_CHANGED,
+                payload={
+                    "status": f"[dim]{ts} round {round_idx+1}/{MAX_AGENT_ROUNDS} | "
+                    f"{usage['input']:,}in {usage['output']:,}out | session: {usage['total_in']:,}+{usage['total_out']:,}[/dim]"
+                },
+            )
         )
-        DEFAULT_EVENT_BUS.publish(
+        get_event_bus().publish(
             AgentEvent(
                 type=AgentEventType.USAGE_UPDATED,
-                payload={"usage": usage},
+                payload={"usage": usage, "summary": CTX.all_usage_summary()},
             )
         )
 
-        # Push usage to TUI after every round (not just on todo updates)
-        if hasattr(UI, "_safe_dispatch"):
-            UI._safe_dispatch("update_usage", CTX.all_usage_summary())
-
         text = _assistant_text(response)
         tool_calls = response.get_tool_calls()
-
-        if hasattr(UI, "set_round_tools_present"):
-            UI.set_round_tools_present(bool(tool_calls))
+        get_event_bus().publish(
+            AgentEvent(
+                type=AgentEventType.ROUND_TOOLS_PRESENT,
+                payload={"has_tools": bool(tool_calls)},
+            )
+        )
 
         assistant_msg: dict[str, Any] = {"role": "assistant", "content": text}
         if tool_calls:
@@ -534,7 +589,12 @@ async def _agent_loop_async(messages: list, stop_event: threading.Event | None =
                 desc = tool_args.get("description", "subtask")
                 sub_mode = tool_args.get("mode", "execute")
                 prompt = tool_args.get("prompt", "")
-                UI.task_start(desc, prompt)
+                get_event_bus().publish(
+                    AgentEvent(
+                        type=AgentEventType.SUBAGENT_TASK_START,
+                        payload={"desc": desc, "prompt_preview": prompt},
+                    )
+                )
                 output = await _run_subagent_async(prompt, mode=sub_mode, stop_event=stop_event)
             else:
                 handler = TOOL_HANDLERS.get(tool_name)
@@ -546,7 +606,12 @@ async def _agent_loop_async(messages: list, stop_event: threading.Event | None =
             if tool_name == "read_file":
                 CTX.track_file(tool_args.get("path", ""))
 
-            UI.tool_call(tool_name, output, tool_input=tool_args)
+            get_event_bus().publish(
+                AgentEvent(
+                    type=AgentEventType.TOOL_CALL_COMPLETED,
+                    payload={"name": tool_name, "output": output, "is_sub": False, "tool_input": tool_args},
+                )
+            )
             messages.append(
                 {
                     "role": "tool",
@@ -573,8 +638,24 @@ async def _agent_loop_async(messages: list, stop_event: threading.Event | None =
     response = await client.complete(
         LLMRequest(messages=messages, system_prompt=SYSTEM, max_tokens=8000, temperature=0)
     )
-    CTX.update_usage(response)
-    DEFAULT_EVENT_BUS.publish(
+    usage = CTX.update_usage(response)
+    ts = datetime.now().strftime("%H:%M:%S")
+    get_event_bus().publish(
+        AgentEvent(
+            type=AgentEventType.STATUS_CHANGED,
+            payload={
+                "status": f"[dim]{ts} hit {MAX_AGENT_ROUNDS}-round limit | "
+                f"{usage['input']:,}in {usage['output']:,}out[/dim]"
+            },
+        )
+    )
+    get_event_bus().publish(
+        AgentEvent(
+            type=AgentEventType.USAGE_UPDATED,
+            payload={"usage": usage, "summary": CTX.all_usage_summary()},
+        )
+    )
+    get_event_bus().publish(
         AgentEvent(
             type=AgentEventType.SESSION_ENDED,
             payload={"reason": "hit_round_limit"},
@@ -583,5 +664,10 @@ async def _agent_loop_async(messages: list, stop_event: threading.Event | None =
     return f"[hit {MAX_AGENT_ROUNDS}-round limit]\n" + _assistant_text(response)
 
 
+async def agent_loop_async(messages: list, stop_event: threading.Event | None = None) -> str:
+    """Public async entry point; used by AgentRunner.run_async()."""
+    return await _agent_loop_async(messages, stop_event=stop_event)
+
+
 def agent_loop(messages: list, stop_event: threading.Event | None = None) -> str:
-    return asyncio.run(_agent_loop_async(messages, stop_event=stop_event))
+    return asyncio.run(agent_loop_async(messages, stop_event=stop_event))

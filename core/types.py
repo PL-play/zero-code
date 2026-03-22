@@ -48,8 +48,20 @@ class AgentEventType(str, Enum):
     USAGE_UPDATED = "usage_updated"
     STATUS_CHANGED = "status_changed"
 
+    ROUND_TOOLS_PRESENT = "round_tools_present"
+
+    TODO_UPDATED = "todo_updated"
+
+    # Debug/log channel (for internal inspection panels).
+    SYSTEM_LOG = "system_log"
+
     AGENT_ERROR = "agent_error"
     USER_NOTIFICATION = "user_notification"
+
+    # Sub-agent specific UI events.
+    SUBAGENT_TASK_START = "subagent_task_start"
+    SUBAGENT_TEXT = "subagent_text"
+    SUBAGENT_LIMIT = "subagent_limit"
 
 
 @dataclass

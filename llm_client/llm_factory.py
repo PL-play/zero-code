@@ -144,10 +144,17 @@ class OpenAICompatibleChatLLMService(LLMService):
             f"data_url={self._capabilities.supports_data_url}"
         )
         logger.info("%s messages=%s", header, payload_text)
+        # Emit into agent event stream so UI (if any) can render it.
         try:
-            from core.state import UI
+            from core.events import DEFAULT_EVENT_BUS
+            from core.types import AgentEvent, AgentEventType
 
-            UI._safe_dispatch("system_log", f"{header}\nmessages={payload_text}")
+            DEFAULT_EVENT_BUS.publish(
+                AgentEvent(
+                    type=AgentEventType.SYSTEM_LOG,
+                    payload={"text": f"{header}\nmessages={payload_text}"},
+                )
+            )
         except Exception:
             pass
 
