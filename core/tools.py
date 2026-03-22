@@ -1,9 +1,11 @@
 import difflib
 import json
+import os
 import queue
 import re
 import subprocess
 import threading
+import time
 import uuid
 from pathlib import Path
 
@@ -25,95 +27,223 @@ from llm_client.web_search import (
 
 MAX_OUTPUT_LINES = 200
 SENTINEL = "___ZERO_CODE_CMD_DONE___"
+_HEAD_LINES = 30
+_TAIL_LINES = 170
 
 FILE_READ_STATE: dict[str, float] = {}
 
 
+def _truncate_output(lines: list[str], head: int = _HEAD_LINES, tail: int = _TAIL_LINES) -> str:
+    """Keep first *head* and last *tail* lines, elide the middle."""
+    limit = head + tail
+    if len(lines) <= limit:
+        return "\n".join(lines)
+    omitted = len(lines) - limit
+    return (
+        "\n".join(lines[:head])
+        + f"\n\n... ({omitted} lines omitted) ...\n\n"
+        + "\n".join(lines[-tail:])
+    )
+
+
 class BashSession:
-    """Persistent bash process that keeps env vars and cwd across calls."""
+    """Persistent bash process with merged stdout/stderr via pty.
+
+    Key improvements over the naive pipe approach:
+    - stdout and stderr are merged into a single pty so output ordering
+      is preserved exactly as the user would see it in a real terminal.
+    - An adaptive idle-timeout detects "command still producing output"
+      vs "command went silent / hung".
+    - On timeout the already-collected output is returned with a status
+      hint instead of returning empty / "(no output)".
+    """
 
     def __init__(self, cwd: Path):
         self._cwd = cwd
-        self._proc = None
+        self._proc: subprocess.Popen | None = None
+        self._q: queue.Queue[str] = queue.Queue()
+        self._master_fd: int | None = None
         self._start()
 
     def _start(self):
+        import pty
+
+        master_fd, slave_fd = pty.openpty()
+        # Disable echo so our sentinel isn't duplicated by the terminal driver.
+        try:
+            import termios
+            attrs = termios.tcgetattr(master_fd)
+            attrs[3] &= ~termios.ECHO  # lflags
+            termios.tcsetattr(master_fd, termios.TCSANOW, attrs)
+        except Exception:
+            pass
+
+        env = os.environ.copy()
+        env["TERM"] = "dumb"
+
         self._proc = subprocess.Popen(
             ["/bin/bash", "--norc", "--noprofile"],
             stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stdout=slave_fd,
+            stderr=slave_fd,
             text=True,
             bufsize=0,
             cwd=str(self._cwd),
+            env=env,
         )
-        self._stdout_q: queue.Queue[str] = queue.Queue()
-        self._stderr_q: queue.Queue[str] = queue.Queue()
-        threading.Thread(target=self._reader, args=(self._proc.stdout, self._stdout_q), daemon=True).start()
-        threading.Thread(target=self._reader, args=(self._proc.stderr, self._stderr_q), daemon=True).start()
+        os.close(slave_fd)
+        self._master_fd = master_fd
+        self._q = queue.Queue()
+        threading.Thread(target=self._reader, daemon=True).start()
 
-    @staticmethod
-    def _reader(stream, q: queue.Queue):
-        for line in stream:
-            q.put(line)
+    def _reader(self):
+        """Read from the pty master fd and push complete lines into the queue.
 
-    def _drain(self, q: queue.Queue, timeout: float) -> tuple[list[str], str | None]:
-        lines = []
-        exit_code = None
+        Many CLI tools (including Homebrew) use carriage returns (\"\\r\") to
+        redraw a single progress line instead of printing full lines ending
+        with \"\\n\". To avoid losing that output when a command runs for a
+        long time, we treat both \"\\n\" and \"\\r\" as line delimiters and
+        emit partial lines as they arrive.
+        """
+        buf = ""
+        fd = self._master_fd
+        if fd is None:
+            return
         try:
             while True:
-                line = q.get(timeout=timeout)
-                if SENTINEL in line:
-                    parts = line.strip().split()
-                    if len(parts) >= 2 and parts[-1].lstrip("-").isdigit():
-                        exit_code = parts[-1]
+                try:
+                    data = os.read(fd, 4096)
+                except OSError:
                     break
-                lines.append(line.rstrip("\n"))
-        except queue.Empty:
+                if not data:
+                    break
+                buf += data.decode("utf-8", errors="replace")
+                # Split on either newline or carriage return, whichever comes first.
+                while True:
+                    idx_n = buf.find("\n")
+                    idx_r = buf.find("\r")
+                    # No delimiter at all: wait for more data.
+                    if idx_n == -1 and idx_r == -1:
+                        break
+                    # Pick the earliest positive index among \n and \r.
+                    candidates = [i for i in (idx_n, idx_r) if i != -1]
+                    cut = min(candidates)
+                    line, buf = buf[:cut], buf[cut + 1 :]
+                    if line:
+                        self._q.put(line)
+            if buf:
+                self._q.put(buf)
+        except Exception:
             pass
+
+    def _drain(self, timeout: float, idle_timeout: float = 5.0) -> tuple[list[str], str | None]:
+        """Collect output lines until the sentinel is seen.
+
+        Uses two time limits:
+        - *timeout*: hard wall-clock cap for the entire command.
+        - *idle_timeout*: maximum silence before we assume the command is
+          done or hung.  Resets every time new output arrives, so a command
+          that keeps printing (e.g. ``brew install``) will never hit this
+          until it truly goes silent.
+
+        Returns (lines, exit_code_str | None).
+        """
+        lines: list[str] = []
+        exit_code: str | None = None
+        deadline = time.monotonic() + timeout
+
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            wait = min(remaining, idle_timeout)
+            try:
+                line = self._q.get(timeout=wait)
+            except queue.Empty:
+                if self._proc is not None and self._proc.poll() is not None:
+                    # Process exited — drain any remaining queued output.
+                    while not self._q.empty():
+                        try:
+                            line = self._q.get_nowait()
+                            cleaned = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", line).rstrip("\r")
+                            if SENTINEL in cleaned:
+                                parts = cleaned.strip().split()
+                                if len(parts) >= 2 and parts[-1].lstrip("-").isdigit():
+                                    exit_code = parts[-1]
+                                break
+                            lines.append(cleaned)
+                        except queue.Empty:
+                            break
+                    break
+                # Still running but silent for idle_timeout seconds.
+                break
+
+            cleaned = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", line).rstrip("\r")
+
+            if SENTINEL in cleaned:
+                parts = cleaned.strip().split()
+                if len(parts) >= 2 and parts[-1].lstrip("-").isdigit():
+                    exit_code = parts[-1]
+                break
+            lines.append(cleaned)
+
         return lines, exit_code
 
     def execute(self, command: str, timeout: int = 120) -> str:
         dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
         if any(d in command for d in dangerous):
-            return "Error: Dangerous command blocked"
+            return (
+                "Error: Dangerous command blocked.\n"
+                "For safety, interactive or privileged commands (like sudo / shutdown) "
+                "must be run manually in your own terminal, not via the agent bash tool."
+            )
 
         if self._proc is None or self._proc.poll() is not None:
             self._start()
 
-        full_cmd = f"{command}\necho {SENTINEL} $?\necho {SENTINEL} >&2\n"
+        # Wrap with sentinel; redirect stderr into stdout is already
+        # handled by the pty, so we only need the stdout sentinel.
+        full_cmd = f"{command}\necho {SENTINEL} $?\n"
         try:
             self._proc.stdin.write(full_cmd)
             self._proc.stdin.flush()
-        except BrokenPipeError:
+        except (BrokenPipeError, OSError):
             self._start()
             return "Error: Bash session crashed, restarted. Please retry."
 
-        stdout_lines, exit_code = self._drain(self._stdout_q, timeout)
-        stderr_lines, _ = self._drain(self._stderr_q, timeout=0.5)
+        lines, exit_code = self._drain(timeout, idle_timeout=5.0)
 
-        if exit_code is None:
-            exit_code = "?"
+        timed_out = exit_code is None
 
-        parts = []
-        if stdout_lines:
-            if len(stdout_lines) > MAX_OUTPUT_LINES:
-                kept = stdout_lines[-MAX_OUTPUT_LINES:]
-                out = f"... ({len(stdout_lines) - MAX_OUTPUT_LINES} lines above) ...\n" + "\n".join(kept)
-            else:
-                out = "\n".join(stdout_lines)
-            parts.append(f"stdout:\n{out}")
-        if stderr_lines:
-            parts.append(f"stderr:\n{chr(10).join(stderr_lines[-50:])}")
-        if not parts:
-            parts.append("(no output)")
-        parts.insert(0, f"exit_code={exit_code}")
-        return "\n".join(parts)[:50000]
+        # Try to recover exit code if process already exited
+        if timed_out and self._proc is not None and self._proc.poll() is not None:
+            exit_code = str(self._proc.returncode)
+            timed_out = False
+
+        header = f"exit_code={exit_code or '?'}"
+        if timed_out:
+            header += f"  (timed out after {timeout}s — command may still be running)"
+
+        if lines:
+            body = _truncate_output(lines)
+        else:
+            body = "(no output)"
+
+        return f"{header}\n{body}"[:50000]
 
     def restart(self):
+        if self._master_fd is not None:
+            try:
+                os.close(self._master_fd)
+            except OSError:
+                pass
+            self._master_fd = None
         if self._proc and self._proc.poll() is None:
             self._proc.terminate()
-            self._proc.wait(timeout=5)
+            try:
+                self._proc.wait(timeout=5)
+            except Exception:
+                self._proc.kill()
         self._start()
         return "Bash session restarted."
 
@@ -140,7 +270,11 @@ class BackgroundManager:
     def run(self, command: str) -> str:
         dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
         if any(d in command for d in dangerous):
-            return "Error: Dangerous command blocked"
+            return (
+                "Error: Dangerous command blocked.\n"
+                "Background tasks do not support interactive or privileged commands "
+                "(like sudo / shutdown). Please run these manually in your own shell."
+            )
 
         scope_err = _validate_bash_command_scope(command)
         if scope_err:
@@ -279,7 +413,10 @@ def run_generate_image(
             filename_prefix=filename_prefix,
             workspace_root=WORKSPACE_DIR,
         )
-        return _tool_json(summarize_image_operation_result(result, operation="generate_image"))
+        summary = summarize_image_operation_result(result, operation="generate_image")
+        summary["workspace"] = str(WORKSPACE_DIR)
+        summary["note"] = "All paths are relative to workspace directory. Use these relative paths directly with read_file or other tools."
+        return _tool_json(summary)
     except Exception as e:
         return _tool_json(summarize_image_operation_error(e, operation="generate_image"))
 
@@ -323,13 +460,14 @@ def run_edit_image(
             filename_prefix=filename_prefix,
             workspace_root=WORKSPACE_DIR,
         )
-        return _tool_json(
-            summarize_image_operation_result(
-                result,
-                operation="edit_image",
-                input_paths=[path.as_posix() for path in resolved_image_paths],
-            )
+        summary = summarize_image_operation_result(
+            result,
+            operation="edit_image",
+            input_paths=[path.as_posix() for path in resolved_image_paths],
         )
+        summary["workspace"] = str(WORKSPACE_DIR)
+        summary["note"] = "All paths are relative to workspace directory. Use these relative paths directly with read_file or other tools."
+        return _tool_json(summary)
     except Exception as e:
         return _tool_json(
             summarize_image_operation_error(
@@ -460,15 +598,16 @@ def _optional_web_search_tools() -> list[dict[str, object]]:
     ]
 
 
-def run_bash(command: str = None, restart: bool = False) -> str:
+def run_bash(command: str = None, restart: bool = False, timeout: int = 120) -> str:
     if restart:
         return BASH.restart()
     if not command:
         return "Error: command is required (or set restart=true)"
+    timeout = max(5, min(int(timeout), 600))
     scope_err = _validate_bash_command_scope(command)
     if scope_err:
         return scope_err
-    return BASH.execute(command)
+    return BASH.execute(command, timeout=timeout)
 
 
 def run_read(path: str, offset: int = None, limit: int = None) -> str:
@@ -514,9 +653,10 @@ def run_write(path: str, content: str) -> str:
         old_size = fp.stat().st_size if existed else 0
         fp.write_text(content)
         line_count = content.count("\n") + (1 if content and not content.endswith("\n") else 0)
+        display = _display_path(fp)
         if existed:
-            return f"Wrote {len(content)} bytes ({line_count} lines) to {path} (overwritten, was {old_size} bytes)"
-        return f"Wrote {len(content)} bytes ({line_count} lines) to {path} (new file)"
+            return f"Wrote {len(content)} bytes ({line_count} lines) to {display} (overwritten, was {old_size} bytes) [workspace: {WORKSPACE_DIR}]"
+        return f"Wrote {len(content)} bytes ({line_count} lines) to {display} (new file) [workspace: {WORKSPACE_DIR}]"
     except Exception as e:
         return f"Error: {e}"
 
@@ -827,8 +967,9 @@ def run_glob(pattern: str, path: str = ".") -> str:
             pattern = "**/" + pattern
         matches = sorted(base.glob(pattern), key=lambda p: p.stat().st_mtime, reverse=True)
         if not matches:
-            return f"No files matching '{pattern}' in {path}"
-        lines = [_display_path(m) for m in matches[:50]]
+            return f"No files matching '{pattern}' in {_display_path(base)} [workspace: {WORKSPACE_DIR}]"
+        header = f"[searched in: {_display_path(base)}, workspace: {WORKSPACE_DIR}]"
+        lines = [header] + [_display_path(m) for m in matches[:50]]
         result = "\n".join(lines)
         if len(matches) > 50:
             result += f"\n... and {len(matches) - 50} more"
@@ -885,7 +1026,7 @@ def check_background(task_id: str = None) -> str:
 
 
 TOOL_HANDLERS = {
-    "bash": lambda **kw: run_bash(kw.get("command"), kw.get("restart", False)),
+    "bash": lambda **kw: run_bash(kw.get("command"), kw.get("restart", False), kw.get("timeout", 120)),
     "read_file": lambda **kw: run_read(kw["path"], kw.get("offset"), kw.get("limit")),
     "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
     "edit_file": lambda **kw: run_edit(
@@ -935,12 +1076,15 @@ if WEB_SEARCH_CONFIG is not None:
 BASE_TOOLS = [
     {
         "name": "bash",
-        "description": "Run a shell command in a persistent bash session rooted at workspace. State (cwd, env vars) persists across calls. Set restart=true to reset.",
+        "description": "Run a shell command in a persistent bash session rooted at workspace. "
+                       "State (cwd, env vars) persists across calls. Set restart=true to reset. "
+                       "For long-running commands (brew install, large builds, etc.) set a higher timeout.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "command": {"type": "string", "description": "Shell command to execute"},
                 "restart": {"type": "boolean", "description": "Set true to restart the bash session"},
+                "timeout": {"type": "integer", "description": "Max seconds to wait (default 120, max 600). Use higher values for long-running commands like package installs or builds."},
             },
         },
     },

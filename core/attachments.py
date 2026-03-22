@@ -191,7 +191,9 @@ def get_attachment_suggestions(raw_path: str, limit: int = ATTACHMENT_SUGGESTION
             seen.add(value)
             candidates.append((rank, {"value": value, "kind": kind, "label": _build_suggestion_label(entry, value, kind)}))
 
-    allow_global_fallback = not explicit_directory_query and not (has_scoped_directory_query and resolved_scoped_directory)
+    # Only fallback to global index when the scoped directory cannot be resolved.
+    # This keeps bare '@' focused on the current directory instead of mixing nested files.
+    allow_global_fallback = not explicit_directory_query and not resolved_scoped_directory
     if len(candidates) < limit and allow_global_fallback:
         for value, kind in _global_attachment_index():
             if value in seen:
@@ -206,7 +208,11 @@ def get_attachment_suggestions(raw_path: str, limit: int = ATTACHMENT_SUGGESTION
             entry_path = Path(value[:-1] if kind == "dir" else value)
             candidates.append((rank, {"value": value, "kind": kind, "label": _build_suggestion_label(entry_path, value, kind)}))
 
-    candidates.sort(key=lambda item: (item[0][0], item[0][1], item[1]["kind"] != "dir", item[0][2]))
+    # For bare '@' queries, prioritize files so they are not hidden behind many directories.
+    if not prefix:
+        candidates.sort(key=lambda item: (item[1]["kind"] == "dir", item[0][2].lower()))
+    else:
+        candidates.sort(key=lambda item: (item[0][0], item[0][1], item[1]["kind"] != "dir", item[0][2]))
     return [item[1] for item in candidates[:limit]]
 
 
@@ -258,9 +264,7 @@ def _resolve_attachment_file(raw_path: str) -> Path | None:
         resolved = safe_path(raw_path)
     except Exception:
         return None
-    if not resolved.is_file():
-        return None
-    return resolved
+    return resolved if resolved.is_file() else None
 
 
 def _find_attachment_token_bounds(text: str, start_index: int) -> tuple[int, str] | None:
@@ -319,6 +323,22 @@ def build_user_message(query: str) -> tuple[dict[str, Any], list[str]]:
 
         resolved = _resolve_attachment_file(raw_path)
         if resolved is None:
+            # 1) 如果是一个目录：不当作“附件”，但仍把它注入为**字面路径**，而不是保留原始的 @token。
+            try:
+                candidate = safe_path(raw_path)
+                if candidate.is_dir():
+                    display = _display_path(candidate)
+                    cleaned_parts.append(f"`{display}`")
+                    cursor = end
+                    # 目录本身不会作为多模态附件上传，只在提示词中以字面路径存在。
+                    continue
+            except Exception as exc:
+                warnings.append(f"Skipping attachment `{raw_path}`: {exc}")
+                cleaned_parts.append(query[start:end])
+                cursor = end
+                continue
+
+            # 2) 既不是文件也不是目录：按原逻辑处理，保留原文并给出 warning。
             try:
                 safe_path(raw_path)
                 warnings.append(f"Skipping attachment `{raw_path}`: not a file")
@@ -337,7 +357,8 @@ def build_user_message(query: str) -> tuple[dict[str, Any], list[str]]:
             continue
 
         if attachment.get("kind") not in {"image", "pdf"}:
-            cleaned_parts.append(raw_path)
+            display = _display_path(Path(attachment["path"]))
+            cleaned_parts.append(f"`{display}`")
             cursor = end
             continue
 
